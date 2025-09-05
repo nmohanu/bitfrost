@@ -4,6 +4,20 @@ use bendy::value::Value;
 
 use std::fs;
 
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum TorrentError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    #[error("Bencode error: {0}")]
+    Bencode(String),
+
+    #[error("Invalid torrent file: {0}")]
+    InvalidTorrent(String),
+}
+
 pub struct TorrentInfo {
     pub announce: String,
     pub name: String,
@@ -12,51 +26,44 @@ pub struct TorrentInfo {
     pub pieces: Vec<u8>,
 }
 
-pub fn parse_torrent_file(path: &str) -> Result<TorrentInfo, Box<dyn std::error::Error>> {
-    let data = fs::read(path)?;
-    let val = Value::from_bencode(&data)
-        .map_err(|e| format!("Failed to decode bencode: {}", e))?;
+pub fn parse_torrent_file(path: &str) -> Result<TorrentInfo, TorrentError> {
+    let data = std::fs::read(path)?; 
+    let val = bendy::value::Value::from_bencode(&data)
+    .map_err(|e| TorrentError::Bencode(format!("Bencode decoding error: {}", e)))?;
 
-    // Top-level dict.
     let dict = match val {
-        Value::Dict(d) => d,
-        _ => return Err("Top-level bencode is not a dictionary".into()),
+        bendy::value::Value::Dict(d) => d,
+        _ => return Err(TorrentError::InvalidTorrent("Top-level is not a dictionary".into())),
     };
 
-    // Announce URL.
     let announce = match dict.get(&b"announce"[..]) {
-        Some(Value::Bytes(b)) => String::from_utf8_lossy(b).into_owned(),
-        _ => return Err("Missing 'announce'".into()),
+        Some(bendy::value::Value::Bytes(b)) => String::from_utf8_lossy(b).into_owned(),
+        _ => return Err(TorrentError::InvalidTorrent("Missing 'announce'".into())),
     };
 
-    // Info dict.
     let info = match dict.get(&b"info"[..]) {
-        Some(Value::Dict(d)) => d,
-        _ => return Err("Missing 'info' dictionary".into()),
+        Some(bendy::value::Value::Dict(d)) => d,
+        _ => return Err(TorrentError::InvalidTorrent("Missing 'info' dictionary".into())),
     };
 
-    // Name.
     let name = match info.get(&b"name"[..]) {
-        Some(Value::Bytes(b)) => String::from_utf8_lossy(b).into_owned(),
-        _ => return Err("Missing 'name'".into()),
+        Some(bendy::value::Value::Bytes(b)) => String::from_utf8_lossy(b).into_owned(),
+        _ => return Err(TorrentError::InvalidTorrent("Missing 'name'".into())),
     };
 
-    // Piece length.
     let piece_length = match info.get(&b"piece length"[..]) {
-        Some(Value::Integer(i)) => *i as u64,
-        _ => return Err("Missing 'piece length'".into()),
+        Some(bendy::value::Value::Integer(i)) => *i as u64,
+        _ => return Err(TorrentError::InvalidTorrent("Missing 'piece length'".into())),
     };
 
-    // Total length (single-file).
     let length = match info.get(&b"length"[..]) {
-        Some(Value::Integer(i)) => Some(*i as u64),
+        Some(bendy::value::Value::Integer(i)) => Some(*i as u64),
         _ => None,
     };
 
-    // Pieces.
     let pieces = match info.get(&b"pieces"[..]) {
-        Some(Value::Bytes(b)) => b.to_vec(),
-        _ => return Err("Missing 'pieces'".into()),
+        Some(bendy::value::Value::Bytes(b)) => b.to_vec(),
+        _ => return Err(TorrentError::InvalidTorrent("Missing 'pieces'".into())),
     };
 
     Ok(TorrentInfo {
