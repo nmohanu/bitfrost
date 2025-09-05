@@ -26,6 +26,7 @@ pub struct TorrentInfo {
     pub pieces: Vec<u8>,
 }
 
+// Parse a .torrent file and return a TorrentInfo struct.
 pub fn parse_torrent_file(path: &str) -> Result<TorrentInfo, TorrentError> {
     let data = std::fs::read(path)?; 
     let val = bendy::value::Value::from_bencode(&data)
