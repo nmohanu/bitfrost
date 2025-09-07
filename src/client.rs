@@ -1,9 +1,10 @@
-use tokio::net::TcpStream;
+use tokio::{io::AsyncWriteExt, io::AsyncReadExt, net::TcpStream};
 
 use thiserror::Error;
 use reqwest::Client;
 
 use rand::RngCore;
+use hex::ToHex;
 
 use bendy::value::Value;
 use bendy::decoding::FromBencode;
@@ -36,15 +37,41 @@ impl TorrentClient {
         println!("Found {} peers", peers.len());
         for peer in peers {
             println!("{}", peer.to_string());
+            perform_handshake(peer, self._torrent.info_hash, self._peer_id).await?;
         }
         Ok(())
-        }
     }
+}
+
+pub fn create_handshake(info_hash: [u8; 20], peer_id: [u8; 20]) -> [u8; 68] {
+    let mut handshake = [0u8; 68];
+    handshake[0] = 19; 
+    handshake[1..20].copy_from_slice(b"BitTorrent protocol"); 
+    handshake[28..48].copy_from_slice(&info_hash); // info_hash.
+    handshake[48..68].copy_from_slice(&peer_id); // peer_id.
+    handshake
+}
+
+pub async fn perform_handshake(peer: SocketAddr, info_hash: [u8; 20], peer_id: [u8; 20]) -> Result<TcpStream, Error> {
+    let mut stream = TcpStream::connect(peer.to_string()).await?;
+    // Perform the BitTorrent handshake.
+    let handshake = create_handshake(info_hash, peer_id);
+    println!("Sending handshake to {}: {:x?}", peer, &handshake);
+    stream.write_all(&handshake).await?;
+
+    // Get response from peer.
+    let mut response = [0u8; 68];
+    stream.read_exact(&mut response).await?;
+
+    println!("Received handshake response from {}: {:x?}", peer, (&response[48..68]).encode_hex::<String>());
+
+    Ok(stream)
+}
 
 pub fn get_client_id() -> [u8; 20] {
     let mut peer_id = [0u8; 20];
     peer_id[..8].copy_from_slice(CLIENT_ID.as_bytes());
-    rand::thread_rng().fill_bytes(&mut peer_id[8..]);
+    rand::rng().fill_bytes(&mut peer_id[8..]);
     peer_id
 }
 
@@ -95,4 +122,7 @@ pub enum Error {
 
     #[error(transparent)]
     Connection(#[from] reqwest::Error),
+
+    #[error(transparent)]
+    Handshake(#[from] std::io::Error),
 }
