@@ -1,6 +1,6 @@
 use sha1::{Sha1, Digest};
 
-use tokio::{io::AsyncWriteExt, io::AsyncReadExt, net::TcpStream, fs::OpenOptions, io::AsyncSeekExt, io::SeekFrom, fs::remove_file};
+use tokio::{io::AsyncWriteExt, io::AsyncReadExt, net::TcpStream, fs::OpenOptions, io::AsyncSeekExt, io::SeekFrom};
 
 use thiserror::Error;
 use reqwest::Client;
