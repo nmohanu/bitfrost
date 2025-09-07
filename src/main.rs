@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let torrent: TorrentInfo = parse_torrent_file(torrent_path)?;
 
     // Start the client.
-    let client: TorrentClient = TorrentClient::new(torrent);
+    let mut client: TorrentClient = TorrentClient::new(torrent);
     client.start().await?;
 
     Ok(())

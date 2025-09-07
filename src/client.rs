@@ -24,15 +24,15 @@ pub struct TorrentClient {
 
 impl TorrentClient {
     pub fn new(torrent: TorrentInfo) -> Self {
-        Self { torrent }
+        Self { _torrent: torrent, _peer_id: [0; 20] }
     }
 
-    pub async fn start(&self) -> Result<(), Error> {
-        _peer_id = get_client_id(); 
-        println!("Starting torrent client for: {}", self.torrent.name);
-        println!("Info Hash: {:x?}", self.torrent.info_hash);
+    pub async fn start(&mut self) -> Result<(), Error> {
+        self._peer_id = get_client_id(); 
+        println!("Starting torrent client for: {}", self._torrent.name);
+        println!("Info Hash: {:x?}", self._torrent.info_hash);
         println!("Getting peers from tracker...");
-        let peers = fetch_peers(&self.torrent, self._peer_id).await?;
+        let peers = fetch_peers(&self._torrent, self._peer_id).await?;
         println!("Found {} peers", peers.len());
         for peer in peers {
             println!("{}", peer.to_string());
