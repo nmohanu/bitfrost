@@ -38,6 +38,7 @@ impl TorrentClient {
         Ok(())
     }
 
+    /// Download the entire file.
     async fn download_file(&self) -> Result<(), Error> {
         let output_path = format!("./{}", self.torrent.name);
         
@@ -95,6 +96,7 @@ impl TorrentClient {
         Ok(())
     }
 
+    /// Download a specific piece from the peer.
     async fn download_piece(&self, index: u32, stream: &mut TcpStream, piece_size: u32) -> Result<Vec<u8>, Error> {
         let mut piece_buffer: Vec<u8> = vec![0; piece_size as usize];
 
@@ -168,10 +170,10 @@ impl TorrentClient {
         std::fs::write("./out.txt", &piece_buffer).map_err(|e| Error::PieceError(format!("Failed to write piece to file: {}", e)))?;
 
         Ok(piece_buffer)
-    }
+    }   
 }
 
-
+/// Create the BitTorrent handshake message.
 pub fn create_handshake(info_hash: [u8; 20], peer_id: [u8; 20]) -> [u8; 68] {
     let mut handshake = [0u8; 68];
     handshake[0] = 19; 
@@ -182,6 +184,7 @@ pub fn create_handshake(info_hash: [u8; 20], peer_id: [u8; 20]) -> [u8; 68] {
     handshake
 }
 
+/// Perform the BitTorrent handshake with a peer.
 pub async fn perform_handshake(peer: &SocketAddr, info_hash: [u8; 20], peer_id: [u8; 20]) -> Result<TcpStream, Error> {
     let mut stream = TcpStream::connect(peer.to_string()).await?;
     // Perform the BitTorrent handshake.
@@ -198,6 +201,7 @@ pub async fn perform_handshake(peer: &SocketAddr, info_hash: [u8; 20], peer_id: 
     Ok(stream)
 }
 
+/// Generate a random peer ID.
 pub fn get_client_id() -> [u8; 20] {
     let mut peer_id = [0u8; 20];
     peer_id[..8].copy_from_slice(CLIENT_ID.as_bytes());
@@ -205,6 +209,7 @@ pub fn get_client_id() -> [u8; 20] {
     peer_id
 }
 
+/// Fetch peers from the tracker.
 pub async fn fetch_peers(torrent_info: &TorrentInfo, id: [u8; 20]) -> Result<Vec<SocketAddr>, Error> {
     let client = Client::new();
 
