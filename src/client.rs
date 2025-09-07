@@ -1,13 +1,12 @@
 use sha1::{Sha1, Digest};
-use tokio::{io::AsyncWriteExt, io::AsyncReadExt, net::TcpStream};
+
+use tokio::{io::AsyncWriteExt, io::AsyncReadExt, net::TcpStream, fs::OpenOptions, io::AsyncSeekExt, io::SeekFrom, fs::remove_file};
 
 use thiserror::Error;
 use reqwest::Client;
 
-use rand::{Fill, RngCore};
+use rand::{RngCore};
 use hex::ToHex;
-
-use std::fs::write;
 
 use bip_bencode::{BDecodeOpt, BRefAccess, BencodeRef};
 
@@ -15,7 +14,7 @@ use urlencoding;
 
 use std::net::{SocketAddr, Ipv4Addr};
 
-use crate::torrent::{TorrentInfo, get_torrent_info_hash};
+use crate::torrent::{TorrentInfo};
 
 const DEFAULT_PORT: u16 = 6881;
 const CLIENT_ID : &str = "-BF0001-"; // BitFrost client identifier
@@ -35,22 +34,35 @@ impl TorrentClient {
         self.peer_id = get_client_id(); 
         println!("Starting torrent client for: {}", self.torrent.name);
         println!("Info Hash: {:x?}", self.torrent.info_hash);
-        println!("Getting peers from tracker...");
-        self.download_piece(0).await?;
+        self.download_file().await?;
         Ok(())
     }
 
-    async fn download_piece(&self, index: u32) -> Result<(), Error> {
+    async fn download_file(&self) -> Result<(), Error> {
+        let output_path = format!("./{}", self.torrent.name);
+        
+        // Remove existing file if it exists.
+        if tokio::fs::metadata(&output_path).await.is_ok() {
+            tokio::fs::remove_file(&output_path).await.expect("Failed to delete file");
+        }
+
+        let mut file = OpenOptions::new()
+        .create(true)
+        .append(true) 
+        .open(&output_path)
+        .await
+        .map_err(|e| Error::PieceError(format!("Failed to open file: {}", e)))?;
+
+        // Fetch peers from tracker.
         let peers = fetch_peers(&self.torrent, self.peer_id).await?;
         let mut stream = perform_handshake(peers.iter().next().unwrap(), self.torrent.info_hash, self.peer_id).await?;
-        let mut piece_buffer: Vec<u8> = vec![0; self.torrent.piece_length as usize];
 
         // Read bitfield message.
         let size = stream.read_u32().await?;
         let _payload_id = stream.read_u8().await?;
         let mut bitfield = vec![0u8; (size - 1) as usize];
         stream.read_exact(&mut bitfield).await?;
-
+        
         // Send the interested message to peer.
         // size is 0001, id is 2.
         const INTERESTED: [u8; 5] = [0, 0, 0, 1, 2];
@@ -63,30 +75,44 @@ impl TorrentClient {
             return Err(Error::StartError("Expected unchoke message".into()));
         }
 
+        // Download pieces.
+        for piece_index in 0..(self.torrent.pieces.len() / 20) {
+            let mut size = self.torrent.piece_length as u32;
+            // Adjust size for the last piece.
+            if piece_index == (self.torrent.pieces.len() / 20) - 1 {
+                size = self.torrent.length.unwrap_or(0) as u32 % self.torrent.piece_length as u32;
+            }
+
+            let piece = self.download_piece(piece_index as u32, &mut stream, size).await?;
+
+            // Write piece to file.
+            file.seek(SeekFrom::Start((piece_index as u64) * (self.torrent.piece_length as u64))).await?;
+            file.write_all(&piece).await?;
+
+            println!("Downloaded piece {}/{}", piece_index + 1, self.torrent.pieces.len() / 20);
+        }
+
+        Ok(())
+    }
+
+    async fn download_piece(&self, index: u32, stream: &mut TcpStream, piece_size: u32) -> Result<Vec<u8>, Error> {
+        let mut piece_buffer: Vec<u8> = vec![0; piece_size as usize];
+
         // Now request the piece in BLOCK_SIZE chunks.
-        for begin in (0..(self.torrent.piece_length)).step_by(BLOCK_SIZE) {
-            let size = std::cmp::min(BLOCK_SIZE as u32, self.torrent.piece_length as u32 - begin as u32);
+        for begin in (0..(piece_size)).step_by(BLOCK_SIZE) {
+            let size = std::cmp::min(BLOCK_SIZE as u32, piece_size - begin as u32);
+            println!("Requesting piece {}, begin {}", index, begin);
+            
             // Request the piece block from the peer.
             let mut request = Vec::with_capacity(17);
-            request.extend_from_slice(&(13u32.to_be_bytes())); // length
-            request.push(6); // request ID
-            request.extend_from_slice(&index.to_be_bytes());
-            request.extend_from_slice(&(begin as u32).to_be_bytes());
-            request.extend_from_slice(&size.to_be_bytes());
+            request.extend_from_slice(&(13u32.to_be_bytes()));                  // length
+            request.push(6);                                                    // id
+            request.extend_from_slice(&index.to_be_bytes());                    // piece index
+            request.extend_from_slice(&(begin as u32).to_be_bytes());           // begin offset
+            request.extend_from_slice(&size.to_be_bytes());                     // block size
 
-            let length = u32::from_be_bytes([request[0], request[1], request[2], request[3]]);
-            let id = request[4];
-            let idx = u32::from_be_bytes([request[5], request[6], request[7], request[8]]);
-            let begin_val = u32::from_be_bytes([request[9], request[10], request[11], request[12]]);
-            let size_val = u32::from_be_bytes([request[13], request[14], request[15], request[16]]);
-
-            println!("Request fields:");
-            println!("  length: {}", length);
-            println!("  id: {}", id);
-            println!("  index: {}", idx);
-            println!("  begin: {}", begin_val);
-            println!("  size: {}", size_val);
-
+            // Send request.
+            println!("Requesting block: index {}, begin {}, size {}", index, begin, size);
             stream.write_all(&request).await?;
 
             // Read the piece message from the peer.
@@ -95,6 +121,7 @@ impl TorrentClient {
             // Length.
             stream.read_exact(&mut buf4).await?;
             let received_size = u32::from_be_bytes(buf4);
+            println!("Received piece message of size: {}", received_size);
             if received_size != size + 9 {
                 return Err(Error::PieceError(format!("Unexpected piece size: {}, expected: {}", received_size, size + 9)));
             }
@@ -103,6 +130,7 @@ impl TorrentClient {
             let mut payload_id_buffer = [0u8; 1];
             stream.read_exact(&mut payload_id_buffer).await?;
             let payload_id = payload_id_buffer[0];
+            println!("Payload ID: {}", payload_id);
             if payload_id != 7 {
                 return Err(Error::PieceError("Expected piece message".into()));
             }
@@ -110,18 +138,21 @@ impl TorrentClient {
             // Piece index.
             stream.read_exact(&mut buf4).await?;
             let received_index = u32::from_be_bytes(buf4);
+            println!("Received piece index: {}", received_index);
             if received_index != index {
                 return Err(Error::PieceError(format!("Unexpected piece index: {}", received_index)));
             }
 
+            // Begin offset.
             stream.read_exact(&mut buf4).await?;
-            let begin = u32::from_be_bytes(buf4);
-            if begin != begin_val {
-                return Err(Error::PieceError(format!("Unexpected begin offset: {}", begin)));
+            let received_begin = u32::from_be_bytes(buf4);
+            println!("Received begin offset: {}", received_begin);
+            if received_begin != begin as u32 {
+                return Err(Error::PieceError(format!("Unexpected begin offset: {}", received_begin)));
             }
 
             // Read data block.
-            stream.read_exact(&mut piece_buffer[begin as usize..(begin as usize + size as usize)]).await?;
+            stream.read_exact(&mut piece_buffer[received_begin as usize..(received_begin as usize + size as usize)]).await?;
         }
 
         // verify hash.
@@ -135,8 +166,8 @@ impl TorrentClient {
         }
 
         std::fs::write("./out.txt", &piece_buffer).map_err(|e| Error::PieceError(format!("Failed to write piece to file: {}", e)))?;
-        
-        Ok(())
+
+        Ok(piece_buffer)
     }
 }
 
@@ -145,6 +176,7 @@ pub fn create_handshake(info_hash: [u8; 20], peer_id: [u8; 20]) -> [u8; 68] {
     let mut handshake = [0u8; 68];
     handshake[0] = 19; 
     handshake[1..20].copy_from_slice(b"BitTorrent protocol"); 
+    handshake[20..28].copy_from_slice(&[0u8; 8]); // reserved
     handshake[28..48].copy_from_slice(&info_hash); // info_hash.
     handshake[48..68].copy_from_slice(&peer_id); // peer_id.
     handshake
