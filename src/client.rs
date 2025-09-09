@@ -1,6 +1,6 @@
-use sha1::{Sha1, Digest};
+use sha1::{digest::typenum::bit, Digest, Sha1};
 
-use tokio::{io::AsyncWriteExt, io::AsyncReadExt, net::TcpStream, fs::OpenOptions, io::AsyncSeekExt, io::SeekFrom};
+use tokio::{fs::OpenOptions, io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream};
 
 use thiserror::Error;
 use reqwest::Client;
@@ -12,165 +12,398 @@ use bip_bencode::{BDecodeOpt, BRefAccess, BencodeRef};
 
 use urlencoding;
 
-use std::net::{SocketAddr, Ipv4Addr};
+use std::{collections::HashMap, net::{Ipv4Addr, SocketAddr}, usize};
 
-use crate::torrent::{TorrentInfo};
+use crate::{torrent::TorrentInfo, util::vec_u8_to_box_bool, bitfield::get_requestable_piece};
+use crate::bitfield::{BitfieldMsg, bitfield_actor, Sender};
 
 const DEFAULT_PORT: u16 = 6881;
-const CLIENT_ID : &str = "-BF0001-"; // BitFrost client identifier
-const BLOCK_SIZE : usize = 16384; // 16KB block size
+const CLIENT_ID : &str = "-BF0001-"; // BitFrost client identifier.
+const BLOCK_SIZE : usize = 16384; // 16KB block size.
+const MAX_WORKER_REQUESTS: usize = 5; // Max pending requests per worker.
+const MAX_CONCURRENT_PEERS: usize = 30; // Limit concurrent peer connections.
+
+pub struct PeerWorker {
+    stream: TcpStream,
+    // Pending requests mapped to whether they've been fulfilled.
+    pending_requests: HashMap<u32, bool>,
+    torrent: TorrentInfo,
+    tx: Sender,
+    peer_addr: SocketAddr,
+}
 
 pub struct TorrentClient {
     torrent: TorrentInfo,
-    peer_id : [u8; 20],
+    output_path: String,
 }
 
 impl TorrentClient {
     pub fn new(torrent: TorrentInfo) -> Self {
-        Self { torrent, peer_id: [0; 20]}
+        let torrent_name = torrent.name.clone();
+        Self {
+            torrent,
+            output_path: format!("./{}", torrent_name),
+        }
     }
 
     pub async fn start(&mut self) -> Result<(), Error> {
-        self.peer_id = get_client_id(); 
+        // Spawn the bitfield actor.
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        // TODO: load existing bitfield from disk if resuming.
+        let initial_bitfield: Box<[bool]> = vec_u8_to_box_bool(vec![0; (self.torrent.pieces.len() / 20 + 7) / 8]);
+
+        // Spawn the bitfield actor. This is a long-lived task that manages the bitfield state.
+        // the actor will receive messages from workers via tx.
+        tokio::spawn(bitfield_actor(rx, initial_bitfield));
+
+        // Set up the file destination.
+        // Remove existing file if it exists.
+        // TODO: pick up where we left off instead of deleting.
+        if tokio::fs::metadata(&self.output_path).await.is_ok() {
+            tokio::fs::remove_file(&self.output_path).await.expect("Failed to delete file");
+        }
+
+        let _file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&self.output_path)
+        .await
+        .map_err(|e| Error::PieceError(format!("Failed to open file: {}", e)))?;
+
         println!("Starting torrent client for: {}", self.torrent.name);
-        println!("Info Hash: {:x?}", self.torrent.info_hash);
-        self.download_file().await?;
+        self.download_file(tx).await?; // Only pass tx, not rx
         Ok(())
     }
 
     /// Download the entire file.
-    async fn download_file(&self) -> Result<(), Error> {
-        let output_path = format!("./{}", self.torrent.name);
-        
-        // Remove existing file if it exists.
-        if tokio::fs::metadata(&output_path).await.is_ok() {
-            tokio::fs::remove_file(&output_path).await.expect("Failed to delete file");
-        }
-
-        let mut file = OpenOptions::new()
-        .create(true)
-        .append(true) 
-        .open(&output_path)
-        .await
-        .map_err(|e| Error::PieceError(format!("Failed to open file: {}", e)))?;
-
+    async fn download_file(&self, tx: Sender) -> Result<(), Error> {
+        let peer_id = get_client_id();
         // Fetch peers from tracker.
-        let peers = fetch_peers(&self.torrent, self.peer_id).await?;
-        let mut stream = perform_handshake(peers.iter().next().unwrap(), self.torrent.info_hash, self.peer_id).await?;
+        let peers = fetch_peers(&self.torrent, peer_id).await?;
 
-        // Read bitfield message.
-        let size = stream.read_u32().await?;
-        let _payload_id = stream.read_u8().await?;
-        let mut bitfield = vec![0u8; (size - 1) as usize];
-        stream.read_exact(&mut bitfield).await?;
+        // Keep track of active workers and available peers.
+        let mut active_workers = 0;
+        let mut peer_index = 0;
+        let target_workers = std::cmp::min(peers.len(), MAX_CONCURRENT_PEERS);
         
-        // Send the interested message to peer.
-        // size is 0001, id is 2.
-        const INTERESTED: [u8; 5] = [0, 0, 0, 1, 2];
-        stream.write_all(&INTERESTED).await?;
+        println!("Target: {} concurrent workers from {} total peers", target_workers, peers.len());
 
-        // Read the unchoke message from peer.
-        let _size = stream.read_u32().await?;
-        let _payload_id = stream.read_u8().await?;
-        if _payload_id != 1 {
-            return Err(Error::StartError("Expected unchoke message".into()));
+        // Connect to peers and spawn workers. If a worker fails, try to replace it.
+        while active_workers < target_workers && peer_index < peers.len() {
+            let peer_addr = peers[peer_index];
+            peer_index += 1;
+
+            match perform_handshake(&peer_addr, self.torrent.info_hash, peer_id).await {
+                Ok(peer_stream) => {
+                    let torrent_clone = self.torrent.clone();
+                    let tx_clone = tx.clone();
+                    active_workers += 1;
+                    
+                    tokio::spawn(async move {
+                        let mut worker = PeerWorker::new(peer_stream, torrent_clone, tx_clone, peer_addr);
+                        if let Err(e) = worker.start_worker().await {
+                            println!("Worker for peer {} failed: {}", peer_addr, e);
+                        }
+                        println!("Worker for peer {} finished", peer_addr);
+                    });
+                }
+                Err(e) => {
+                    println!("Failed to connect to peer {}: {}", peer_addr, e);
+                }
+            }
         }
+        
+        // For now, wait and see worker output.
+        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+        println!("Download timeout reached");
+        
+        Ok(())
+    }
+}
 
-        // Download pieces.
-        for piece_index in 0..(self.torrent.pieces.len() / 20) {
-            let mut size = self.torrent.piece_length as u32;
-            // Adjust size for the last piece.
-            if piece_index == (self.torrent.pieces.len() / 20) - 1 {
-                size = self.torrent.length.unwrap_or(0) as u32 % self.torrent.piece_length as u32;
+impl PeerWorker {
+    pub fn new(stream: TcpStream, torrent: TorrentInfo, tx: Sender, peer_addr: SocketAddr) -> Self {
+        Self {
+            stream,
+            pending_requests: HashMap::new(),
+            torrent,
+            tx,
+            peer_addr,
+        }
+    }
+
+    async fn start_worker(&mut self) -> Result<(), Error> {
+        println!("Worker started for peer {}", self.peer_addr);
+        let mut choked = true;
+        let mut next_piece = None;
+        let mut piece_buffer: Vec<u8> = vec![0; self.torrent.piece_length as usize];
+        
+        loop {
+            let message = read_peer_message(&mut self.stream).await;
+            if message.is_err() {
+                println!("Connection to peer {} lost: {}", self.peer_addr, message.err().unwrap());
+                return Ok(());
+            }
+            let (payload_id, payload) = message.unwrap();
+            println!("Worker {}: Received message type {}", self.peer_addr, payload_id);
+            
+            match payload_id {
+                0 => {
+                    // Choke message.
+                    println!("Worker {}: Choked", self.peer_addr);
+                    choked = true;
+                }
+                1 => {
+                    // Unchoke message.
+                    println!("Worker {}: Unchoked", self.peer_addr);
+                    choked = false;
+                }
+                2 => {
+                    // Interested message.
+                    println!("Worker {}: Peer is interested", self.peer_addr);
+                }
+                3 => {
+                    // Not interested message.
+                    println!("Worker {}: Peer not interested", self.peer_addr);
+                }
+                4 => {
+                    // Have message, update bitfield.
+                    println!("Worker {}: Peer has piece", self.peer_addr);
+                }
+                5 => {
+                    // Bitfield message, update bitfield.
+                    println!("Worker {}: Received bitfield of {} bytes", self.peer_addr, payload.len());
+                    
+                    // Debug: print the raw bitfield bytes.
+                    println!("Worker {}: Raw bitfield: {:02x?}", self.peer_addr, &payload[..std::cmp::min(4, payload.len())]);
+                    
+                    let bitfield = vec_u8_to_box_bool(payload.to_vec());
+                    
+                    // Debug: count how many pieces the peer has
+                    let peer_piece_count = bitfield.iter().filter(|&&x| x).count();
+                    println!("Worker {}: Peer has {} out of {} pieces", 
+                             self.peer_addr, peer_piece_count, self.torrent.pieces.len() / 20);
+                    
+                    next_piece = get_requestable_piece(&self.tx, bitfield).await.unwrap();
+                    if next_piece.is_none() {
+                        println!("Worker {}: No pieces available to request", self.peer_addr);
+                        continue;
+                    }
+
+                    // TODO: make sure we dont switch pieces if we are mid-piece.
+
+                    // Send the interested message to peer.
+                    println!("Worker {}: Sending interested message for piece: {:?}", self.peer_addr, next_piece);
+                    const INTERESTED: [u8; 5] = [0, 0, 0, 1, 2];
+                    self.stream.write_all(&INTERESTED).await?;
+                }
+                6 => {
+                    // Request message, send piece data.
+                    println!("Worker {}: Sending piece data", self.peer_addr);
+                }
+                7 => {
+                    // Verify received block.
+                    // First 4 bytes are piece index.
+                    let received_index = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                    if received_index != next_piece.unwrap_or(usize::MAX) as u32 {
+                        continue;
+                    }
+                    // Get begin index.
+                    let begin = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                    // Mark the block as fulfilled.
+                    self.pending_requests.insert(next_piece.unwrap() as u32, true);
+                    // Write block into piece buffer.
+                    piece_buffer[begin as usize..(begin as usize + payload.len() - 8)].copy_from_slice(&payload[8..]);
+                    
+                    println!("Worker {}: Received block for piece {}, offset {}, size {}", 
+                             self.peer_addr, received_index, begin, payload.len() - 8);
+
+                    if self.received_all_blocks() {
+                        if self.verify_piece(next_piece.unwrap() as u32, piece_buffer) {
+                            // We have verified the piece, register it as completed.
+                            self.tx.send(BitfieldMsg::Have(next_piece.unwrap() as usize)).await.unwrap();
+                            println!("Successfully downloaded and verified piece {}", next_piece.unwrap());
+                        } else {
+                            // Piece verification failed, register piece as failed.
+                            self.tx.send(BitfieldMsg::PieceFailed(next_piece.unwrap() as u32)).await.unwrap();
+                        }
+                        return Ok(());
+                    }
+                }
+                8 => {
+                    // Cancel message, ignore for now.
+                }
+                _ => {
+                    // Other message, ignore.
+                }
             }
 
-            let piece = self.download_piece(piece_index as u32, &mut stream, size).await?;
-
-            // Write piece to file.
-            file.seek(SeekFrom::Start((piece_index as u64) * (self.torrent.piece_length as u64))).await?;
-            file.write_all(&piece).await?;
-
-            println!("Downloaded piece {}/{}", piece_index + 1, self.torrent.pieces.len() / 20);
+            // Request pieces if possible.
+            if !choked && next_piece.is_some() && self.pending_requests.len() < MAX_WORKER_REQUESTS {
+                let block_to_request = self.next_block();
+                if block_to_request.is_none() {
+                    continue;
+                }
+                let mut size: usize = self.torrent.piece_length as usize;
+                // Adjust size for the last piece.
+                if next_piece == Some((self.torrent.pieces.len() / 20) - 1) {
+                    size = self.torrent.length.unwrap_or(0) as usize % self.torrent.piece_length as usize;
+                }
+                if let Err(e) = self.request_block(next_piece.unwrap(), block_to_request.unwrap(), size).await {
+                    println!("Worker {}: Failed to request block: {}", self.peer_addr, e);
+                }
+            }
         }
+    }
+    /// Check if we have received the entire piece. We do this by checking if all requested blocks are fulfilled.
+    /// and by checking whether the number of pending requests matches the piece length.
+    fn received_all_blocks(&self) -> bool {
+        
+        if self.pending_requests.len() * BLOCK_SIZE < self.torrent.piece_length as usize {
+            return false;
+        }
+        for &fulfilled in self.pending_requests.values() {
+            if !fulfilled {
+                return false;
+            }
+        }
+        true
+    }
 
+    fn verify_piece(&self, index: u32, piece_buffer: Vec<u8>) -> bool {
+        let mut hasher = Sha1::new();
+        hasher.update(piece_buffer);
+        let result = hasher.finalize();
+        let expected = &self.torrent.pieces[(index as usize * 20)..(index as usize * 20 + 20)];
+        result.as_slice() == expected
+    }
+ 
+    async fn request_block(&mut self, index: usize, begin: usize, piece_size: usize) -> Result<(), Error> {
+        let size = std::cmp::min(BLOCK_SIZE as u32, piece_size as u32 - begin as u32);
+        // Create request message.
+        let mut request = Vec::with_capacity(17);
+        request.extend_from_slice(&(13u32.to_be_bytes()));                  // length
+        request.push(6);                                                    // id
+        request.extend_from_slice(&index.to_be_bytes());                    // piece index
+        request.extend_from_slice(&(begin as u32).to_be_bytes());           // begin offset
+        request.extend_from_slice(&size.to_be_bytes());                     // block size
+        self.stream.write_all(&request).await?;
+
+        self.pending_requests.insert(begin as u32, false);
+
+        println!("Worker {}: Requested block at piece {}, offset {}, size {}", 
+                 self.peer_addr, index, begin, size);   
         Ok(())
     }
 
-    /// Download a specific piece from the peer.
-    async fn download_piece(&self, index: u32, stream: &mut TcpStream, piece_size: u32) -> Result<Vec<u8>, Error> {
-        let mut piece_buffer: Vec<u8> = vec![0; piece_size as usize];
-
-        // Now request the piece in BLOCK_SIZE chunks.
-        for begin in (0..(piece_size)).step_by(BLOCK_SIZE) {
-            let size = std::cmp::min(BLOCK_SIZE as u32, piece_size - begin as u32);
-            println!("Requesting piece {}, begin {}", index, begin);
-            
-            // Request the piece block from the peer.
-            let mut request = Vec::with_capacity(17);
-            request.extend_from_slice(&(13u32.to_be_bytes()));                  // length
-            request.push(6);                                                    // id
-            request.extend_from_slice(&index.to_be_bytes());                    // piece index
-            request.extend_from_slice(&(begin as u32).to_be_bytes());           // begin offset
-            request.extend_from_slice(&size.to_be_bytes());                     // block size
-
-            // Send request.
-            println!("Requesting block: index {}, begin {}, size {}", index, begin, size);
-            stream.write_all(&request).await?;
-
-            // Read the piece message from the peer.
-            let mut buf4 = [0u8; 4];
-
-            // Length.
-            stream.read_exact(&mut buf4).await?;
-            let received_size = u32::from_be_bytes(buf4);
-            println!("Received piece message of size: {}", received_size);
-            if received_size != size + 9 {
-                return Err(Error::PieceError(format!("Unexpected piece size: {}, expected: {}", received_size, size + 9)));
+    fn next_block(&self) -> Option<usize> {
+        for i in (0..(self.torrent.piece_length)).step_by(BLOCK_SIZE) {
+            if !self.pending_requests.contains_key(&(i as u32)) {
+                return Some(i as usize);
             }
-            
-            // Payload id.
-            let mut payload_id_buffer = [0u8; 1];
-            stream.read_exact(&mut payload_id_buffer).await?;
-            let payload_id = payload_id_buffer[0];
-            println!("Payload ID: {}", payload_id);
-            if payload_id != 7 {
-                return Err(Error::PieceError("Expected piece message".into()));
-            }
-            
-            // Piece index.
-            stream.read_exact(&mut buf4).await?;
-            let received_index = u32::from_be_bytes(buf4);
-            println!("Received piece index: {}", received_index);
-            if received_index != index {
-                return Err(Error::PieceError(format!("Unexpected piece index: {}", received_index)));
-            }
+        }
+        None
+    }
+}
 
-            // Begin offset.
-            stream.read_exact(&mut buf4).await?;
-            let received_begin = u32::from_be_bytes(buf4);
-            println!("Received begin offset: {}", received_begin);
-            if received_begin != begin as u32 {
-                return Err(Error::PieceError(format!("Unexpected begin offset: {}", received_begin)));
-            }
+/*
+async fn download_piece(&self, index: u32, stream: &mut TcpStream, piece_size: u32) -> Result<Vec<u8>, Error> {
+    let mut piece_buffer: Vec<u8> = vec![0; piece_size as usize];
 
-            // Read data block.
-            stream.read_exact(&mut piece_buffer[received_begin as usize..(received_begin as usize + size as usize)]).await?;
+    // Now request the piece in BLOCK_SIZE chunks.
+    for begin in (0..(piece_size)).step_by(BLOCK_SIZE) {
+        let size = std::cmp::min(BLOCK_SIZE as u32, piece_size - begin as u32);
+        println!("Requesting piece {}, begin {}", index, begin);
+        
+        // Request the piece block from the peer.
+        let mut request = Vec::with_capacity(17);
+        request.extend_from_slice(&(13u32.to_be_bytes()));                  // length
+        request.push(6);                                                    // id
+        request.extend_from_slice(&index.to_be_bytes());                    // piece index
+        request.extend_from_slice(&(begin as u32).to_be_bytes());           // begin offset
+        request.extend_from_slice(&size.to_be_bytes());                     // block size
+
+        // Send request.
+        println!("Requesting block: index {}, begin {}, size {}", index, begin, size);
+        stream.write_all(&request).await?;
+
+        // Read the piece message from the peer.
+        let mut buf4 = [0u8; 4];
+
+        // Length.
+        stream.read_exact(&mut buf4).await?;
+        let received_size = u32::from_be_bytes(buf4);
+        println!("Received piece message of size: {}", received_size);
+        if received_size != size + 9 {
+            return Err(Error::PieceError(format!("Unexpected piece size: {}, expected: {}", received_size, size + 9)));
+        }
+        
+        // Payload id.
+        let mut payload_id_buffer = [0u8; 1];
+        stream.read_exact(&mut payload_id_buffer).await?;
+        let payload_id = payload_id_buffer[0];
+        println!("Payload ID: {}", payload_id);
+        if payload_id != 7 {
+            return Err(Error::PieceError("Expected piece message".into()));
+        }
+        
+        // Piece index.
+        stream.read_exact(&mut buf4).await?;
+        let received_index = u32::from_be_bytes(buf4);
+        println!("Received piece index: {}", received_index);
+        if received_index != index {
+            return Err(Error::PieceError(format!("Unexpected piece index: {}", received_index)));
         }
 
-        // verify hash.
-        let mut hasher = Sha1::new();
-        hasher.update(&piece_buffer);
-        let result = hasher.finalize();
-        let expected = &self.torrent.pieces[(index as usize * 20)..(index as usize * 20 + 20)];
-
-        if result.as_slice() != expected {
-            return Err(Error::PieceError("Piece hash mismatch".into()));
+        // Begin offset.
+        stream.read_exact(&mut buf4).await?;
+        let received_begin = u32::from_be_bytes(buf4);
+        println!("Received begin offset: {}", received_begin);
+        if received_begin != begin as u32 {
+            return Err(Error::PieceError(format!("Unexpected begin offset: {}", received_begin)));
         }
 
-        std::fs::write("./out.txt", &piece_buffer).map_err(|e| Error::PieceError(format!("Failed to write piece to file: {}", e)))?;
+        // Read data block.
+        stream.read_exact(&mut piece_buffer[received_begin as usize..(received_begin as usize + size as usize)]).await?;
+    }
 
-        Ok(piece_buffer)
-    }   
+    // verify hash.
+    let mut hasher = Sha1::new();
+    hasher.update(&piece_buffer);
+    let result = hasher.finalize();
+    let expected = &self.torrent.pieces[(index as usize * 20)..(index as usize * 20 + 20)];
+
+    if result.as_slice() != expected {
+        return Err(Error::PieceError("Piece hash mismatch".into()));
+    }
+
+    std::fs::write("./out.txt", &piece_buffer).map_err(|e| Error::PieceError(format!("Failed to write piece to file: {}", e)))?;
+
+    Ok(piece_buffer)
+}
+    */
+
+/// Read a message from the peer. Returns the payload id and payload data.
+async fn read_peer_message(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), Error> {
+    let mut buf4 = [0u8; 4];
+    // Read the length prefix.
+    stream.read_exact(&mut buf4).await?;
+    let size = u32::from_be_bytes(buf4);
+    if size == 0 {
+        // Keep-alive message.
+        return Ok((0, vec![]));
+    }
+
+    // Read the payload id.
+    let mut payload_id_buffer = [0u8; 1];
+    stream.read_exact(&mut payload_id_buffer).await?;
+    let payload_id = payload_id_buffer[0];
+
+    // Read the payload data.
+    let mut payload = vec![0u8; (size - 1) as usize];
+    stream.read_exact(&mut payload).await?;
+
+    Ok((payload_id, payload))
 }
 
 /// Create the BitTorrent handshake message.

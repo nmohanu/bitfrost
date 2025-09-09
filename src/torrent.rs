@@ -6,6 +6,7 @@ use std::fs;
 
 use thiserror::Error;
 
+#[derive(Clone)]
 pub struct TorrentInfo {
     pub announce: String,
     pub name: String,

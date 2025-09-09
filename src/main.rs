@@ -1,12 +1,10 @@
 mod torrent;
 mod client;
-
-use std::env;
+mod bitfield;
+mod util;
 
 use crate::torrent::{TorrentInfo, parse_torrent_file};
 use crate::client::TorrentClient;
-
-use thiserror::Error;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
