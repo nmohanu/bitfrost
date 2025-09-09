@@ -137,7 +137,8 @@ impl PeerWorker {
         let mut choked = true;
         let mut next_piece = None;
         let mut piece_buffer: Vec<u8> = vec![0; self.torrent.piece_length as usize];
-        
+        let mut piece_size = self.torrent.piece_length as usize;
+
         loop {
             let message = read_peer_message(&mut self.stream).await;
             if message.is_err() {
@@ -185,6 +186,12 @@ impl PeerWorker {
                              self.peer_addr, peer_piece_count, self.torrent.pieces.len() / 20);
                     
                     next_piece = get_requestable_piece(&self.tx, bitfield).await.unwrap();
+                    // Adjust size for the last piece.
+                    if next_piece == Some((self.torrent.pieces.len() / 20) - 1) {
+                        piece_size = self.torrent.length.unwrap_or(0) as usize % self.torrent.piece_length as usize;
+                        piece_buffer = vec![0; piece_size];
+                    }
+
                     if next_piece.is_none() {
                         println!("Worker {}: No pieces available to request", self.peer_addr);
                         continue;
@@ -213,14 +220,14 @@ impl PeerWorker {
                     // Get begin index.
                     let begin = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
                     // Mark the block as fulfilled.
-                    self.pending_requests.insert(next_piece.unwrap() as u32, true);
+                    self.pending_requests.insert(begin, true);
                     // Write block into piece buffer.
                     piece_buffer[begin as usize..(begin as usize + payload.len() - 8)].copy_from_slice(&payload[8..]);
                     
                     println!("Worker {}: Received block for piece {}, offset {}, size {}", 
                              self.peer_addr, received_index, begin, payload.len() - 8);
 
-                    if self.received_all_blocks() {
+                    if self.received_all_blocks(piece_size) {
                         if self.verify_piece(next_piece.unwrap() as u32, piece_buffer) {
                             // We have verified the piece, register it as completed.
                             self.tx.send(BitfieldMsg::Have(next_piece.unwrap() as usize)).await.unwrap();
@@ -247,30 +254,29 @@ impl PeerWorker {
                 if block_to_request.is_none() {
                     continue;
                 }
-                let mut size: usize = self.torrent.piece_length as usize;
-                // Adjust size for the last piece.
-                if next_piece == Some((self.torrent.pieces.len() / 20) - 1) {
-                    size = self.torrent.length.unwrap_or(0) as usize % self.torrent.piece_length as usize;
-                }
-                if let Err(e) = self.request_block(next_piece.unwrap(), block_to_request.unwrap(), size).await {
+
+                if let Err(e) = self.request_block(next_piece.unwrap(), block_to_request.unwrap(), piece_size).await {
                     println!("Worker {}: Failed to request block: {}", self.peer_addr, e);
                 }
+
+                // Mark the block as requested.
+                self.pending_requests.insert(block_to_request.unwrap() as u32, false);
             }
         }
     }
     /// Check if we have received the entire piece. We do this by checking if all requested blocks are fulfilled.
     /// and by checking whether the number of pending requests matches the piece length.
-    fn received_all_blocks(&self) -> bool {
-        
-        if self.pending_requests.len() * BLOCK_SIZE < self.torrent.piece_length as usize {
-            return false;
-        }
-        for &fulfilled in self.pending_requests.values() {
+    fn received_all_blocks(&self, piece_size: usize) -> bool {
+        let mut total = 0;
+        for (&begin, &fulfilled) in &self.pending_requests {
             if !fulfilled {
                 return false;
             }
+            // Each block is BLOCK_SIZE except possibly the last one
+            let block_len = std::cmp::min(BLOCK_SIZE, piece_size.saturating_sub(begin as usize));
+            total += block_len;
         }
-        true
+        total >= piece_size
     }
 
     fn verify_piece(&self, index: u32, piece_buffer: Vec<u8>) -> bool {
