@@ -17,12 +17,18 @@ use std::{collections::HashMap, net::{Ipv4Addr, SocketAddr}, usize};
 use crate::{torrent::TorrentInfo, util::vec_u8_to_box_bool, bitfield::get_requestable_piece};
 use crate::bitfield::{BitfieldMsg, bitfield_actor, Sender};
 
-const DEFAULT_PORT: u16 = 6881;
+const DEFAULT_PORT: u16 = 6881; 
 const CLIENT_ID : &str = "-BF0001-"; // BitFrost client identifier.
 const BLOCK_SIZE : usize = 16384; // 16KB block size.
 const MAX_WORKER_REQUESTS: usize = 5; // Max pending requests per worker.
 const MAX_CONCURRENT_PEERS: usize = 30; // Limit concurrent peer connections.
 
+/// A worker that manages communication with a single peer.
+/// It handles the BitTorrent protocol messages, piece requests, and data verification.
+/// It communicates with the bitfield actor to update piece availability.
+/// After downloading a piece, it verifies the piece hash and updates the bitfield accordingly.
+/// if the piece verification fails, it notifies the bitfield actor to mark the piece as failed.
+/// This allows the client to retry failed pieces later.
 pub struct PeerWorker {
     stream: TcpStream,
     // Pending requests mapped to whether they've been fulfilled.
@@ -32,12 +38,15 @@ pub struct PeerWorker {
     peer_addr: SocketAddr,
 }
 
+/// The state for the download client. 
 pub struct TorrentClient {
     torrent: TorrentInfo,
     output_path: String,
 }
 
 impl TorrentClient {
+    /// Create a new TorrentClient. The output path is derived from the torrent name.
+    /// TODO: Allow specifying custom output path.
     pub fn new(torrent: TorrentInfo) -> Self {
         let torrent_name = torrent.name.clone();
         Self {
@@ -46,6 +55,8 @@ impl TorrentClient {
         }
     }
 
+    /// Start the torrent client. This sets up the bitfield actor, file output, and starts the
+    /// download process.
     pub async fn start(&mut self) -> Result<(), Error> {
         // Spawn the bitfield actor.
         let (tx, rx) = tokio::sync::mpsc::channel(32);
@@ -76,8 +87,10 @@ impl TorrentClient {
     }
 
     /// Download the entire file.
+    /// Here we manage peer connections and spawn workers.
     async fn download_file(&self, tx: Sender) -> Result<(), Error> {
         let peer_id = get_client_id();
+
         // Fetch peers from tracker.
         let peers = fetch_peers(&self.torrent, peer_id).await?;
 
@@ -314,83 +327,6 @@ impl PeerWorker {
         None
     }
 }
-
-/*
-async fn download_piece(&self, index: u32, stream: &mut TcpStream, piece_size: u32) -> Result<Vec<u8>, Error> {
-    let mut piece_buffer: Vec<u8> = vec![0; piece_size as usize];
-
-    // Now request the piece in BLOCK_SIZE chunks.
-    for begin in (0..(piece_size)).step_by(BLOCK_SIZE) {
-        let size = std::cmp::min(BLOCK_SIZE as u32, piece_size - begin as u32);
-        println!("Requesting piece {}, begin {}", index, begin);
-        
-        // Request the piece block from the peer.
-        let mut request = Vec::with_capacity(17);
-        request.extend_from_slice(&(13u32.to_be_bytes()));                  // length
-        request.push(6);                                                    // id
-        request.extend_from_slice(&index.to_be_bytes());                    // piece index
-        request.extend_from_slice(&(begin as u32).to_be_bytes());           // begin offset
-        request.extend_from_slice(&size.to_be_bytes());                     // block size
-
-        // Send request.
-        println!("Requesting block: index {}, begin {}, size {}", index, begin, size);
-        stream.write_all(&request).await?;
-
-        // Read the piece message from the peer.
-        let mut buf4 = [0u8; 4];
-
-        // Length.
-        stream.read_exact(&mut buf4).await?;
-        let received_size = u32::from_be_bytes(buf4);
-        println!("Received piece message of size: {}", received_size);
-        if received_size != size + 9 {
-            return Err(Error::PieceError(format!("Unexpected piece size: {}, expected: {}", received_size, size + 9)));
-        }
-        
-        // Payload id.
-        let mut payload_id_buffer = [0u8; 1];
-        stream.read_exact(&mut payload_id_buffer).await?;
-        let payload_id = payload_id_buffer[0];
-        println!("Payload ID: {}", payload_id);
-        if payload_id != 7 {
-            return Err(Error::PieceError("Expected piece message".into()));
-        }
-        
-        // Piece index.
-        stream.read_exact(&mut buf4).await?;
-        let received_index = u32::from_be_bytes(buf4);
-        println!("Received piece index: {}", received_index);
-        if received_index != index {
-            return Err(Error::PieceError(format!("Unexpected piece index: {}", received_index)));
-        }
-
-        // Begin offset.
-        stream.read_exact(&mut buf4).await?;
-        let received_begin = u32::from_be_bytes(buf4);
-        println!("Received begin offset: {}", received_begin);
-        if received_begin != begin as u32 {
-            return Err(Error::PieceError(format!("Unexpected begin offset: {}", received_begin)));
-        }
-
-        // Read data block.
-        stream.read_exact(&mut piece_buffer[received_begin as usize..(received_begin as usize + size as usize)]).await?;
-    }
-
-    // verify hash.
-    let mut hasher = Sha1::new();
-    hasher.update(&piece_buffer);
-    let result = hasher.finalize();
-    let expected = &self.torrent.pieces[(index as usize * 20)..(index as usize * 20 + 20)];
-
-    if result.as_slice() != expected {
-        return Err(Error::PieceError("Piece hash mismatch".into()));
-    }
-
-    std::fs::write("./out.txt", &piece_buffer).map_err(|e| Error::PieceError(format!("Failed to write piece to file: {}", e)))?;
-
-    Ok(piece_buffer)
-}
-    */
 
 /// Read a message from the peer. Returns the payload id and payload data.
 async fn read_peer_message(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), Error> {
