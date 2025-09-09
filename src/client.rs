@@ -206,6 +206,8 @@ impl PeerWorker {
                     // First 4 bytes are piece index.
                     let received_index = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
                     if received_index != next_piece.unwrap_or(usize::MAX) as u32 {
+                        println!("Worker {}: Received piece index {} does not match requested piece {}", 
+                                 self.peer_addr, received_index, next_piece.unwrap());
                         continue;
                     }
                     // Get begin index.
@@ -226,6 +228,7 @@ impl PeerWorker {
                         } else {
                             // Piece verification failed, register piece as failed.
                             self.tx.send(BitfieldMsg::PieceFailed(next_piece.unwrap() as u32)).await.unwrap();
+                            println!("Piece verification failed for piece {}", next_piece.unwrap());
                         }
                         return Ok(());
                     }
@@ -282,11 +285,11 @@ impl PeerWorker {
         let size = std::cmp::min(BLOCK_SIZE as u32, piece_size as u32 - begin as u32);
         // Create request message.
         let mut request = Vec::with_capacity(17);
-        request.extend_from_slice(&(13u32.to_be_bytes()));                  // length
-        request.push(6);                                                    // id
-        request.extend_from_slice(&index.to_be_bytes());                    // piece index
-        request.extend_from_slice(&(begin as u32).to_be_bytes());           // begin offset
-        request.extend_from_slice(&size.to_be_bytes());                     // block size
+        request.extend_from_slice(&(13u32.to_be_bytes()));                // length
+        request.push(6);                                                  // id
+        request.extend_from_slice(&(index as u32).to_be_bytes());         // piece index (4 bytes).
+        request.extend_from_slice(&(begin as u32).to_be_bytes());         // begin offset (4 bytes).
+        request.extend_from_slice(&(size as u32).to_be_bytes());          // block size (4 bytes).
         self.stream.write_all(&request).await?;
 
         self.pending_requests.insert(begin as u32, false);
