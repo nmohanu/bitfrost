@@ -1,7 +1,8 @@
 mod torrent;
 mod client;
-mod bitfield;
+mod bitfield_actor;
 mod util;
+mod output_actor;
 
 use crate::torrent::{TorrentInfo, parse_torrent_file};
 use crate::client::TorrentClient;

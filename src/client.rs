@@ -14,8 +14,9 @@ use urlencoding;
 
 use std::{collections::HashMap, net::{Ipv4Addr, SocketAddr}, usize};
 
-use crate::{torrent::TorrentInfo, util::vec_u8_to_box_bool, bitfield::get_requestable_piece};
-use crate::bitfield::{BitfieldMsg, bitfield_actor, Sender};
+use crate::{torrent::TorrentInfo, util::vec_u8_to_box_bool, bitfield_actor::get_requestable_piece};
+use crate::bitfield_actor::{BitfieldMsg, bitfield_actor, BitfieldSender};
+use crate::output_actor::{OutputMsg, output_actor, OutputSender, OutputReceiver};
 
 const DEFAULT_PORT: u16 = 6881; 
 const CLIENT_ID : &str = "-BF0001-"; // BitFrost client identifier.
@@ -34,7 +35,8 @@ pub struct PeerWorker {
     // Pending requests mapped to whether they've been fulfilled.
     pending_requests: HashMap<u32, bool>,
     torrent: TorrentInfo,
-    tx: Sender,
+    bitfield_tx: BitfieldSender,
+    output_tx: OutputSender,
     peer_addr: SocketAddr,
 }
 
@@ -59,13 +61,17 @@ impl TorrentClient {
     /// download process.
     pub async fn start(&mut self) -> Result<(), Error> {
         // Spawn the bitfield actor.
-        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let (bitfield_tx, bitfield_rx) = tokio::sync::mpsc::channel(32);
+        let (output_tx, output_rx) = tokio::sync::mpsc::channel(32);
         // TODO: load existing bitfield from disk if resuming.
         let initial_bitfield: Box<[bool]> = vec_u8_to_box_bool(vec![0; (self.torrent.pieces.len() / 20 + 7) / 8]);
 
         // Spawn the bitfield actor. This is a long-lived task that manages the bitfield state.
         // the actor will receive messages from workers via tx.
-        tokio::spawn(bitfield_actor(rx, initial_bitfield));
+        tokio::spawn(bitfield_actor(bitfield_rx, initial_bitfield));
+        
+        // Spawn the output actor. This handles writing pieces to disk.
+        tokio::spawn(output_actor(output_rx, self.torrent.clone()));
 
         // Set up the file destination.
         // Remove existing file if it exists.
@@ -74,21 +80,14 @@ impl TorrentClient {
             tokio::fs::remove_file(&self.output_path).await.expect("Failed to delete file");
         }
 
-        let _file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&self.output_path)
-        .await
-        .map_err(|e| Error::PieceError(format!("Failed to open file: {}", e)))?;
-
         println!("Starting torrent client for: {}", self.torrent.name);
-        self.download_file(tx).await?; // Only pass tx, not rx
+        self.download_file(bitfield_tx, output_tx).await?;
         Ok(())
     }
 
     /// Download the entire file.
     /// Here we manage peer connections and spawn workers.
-    async fn download_file(&self, tx: Sender) -> Result<(), Error> {
+    async fn download_file(&self, bitfield_tx: BitfieldSender, output_tx: OutputSender) -> Result<(), Error> {
         let peer_id = get_client_id();
 
         // Fetch peers from tracker.
@@ -109,11 +108,12 @@ impl TorrentClient {
             match perform_handshake(&peer_addr, self.torrent.info_hash, peer_id).await {
                 Ok(peer_stream) => {
                     let torrent_clone = self.torrent.clone();
-                    let tx_clone = tx.clone();
+                    let bitfield_tx_clone = bitfield_tx.clone();
+                    let output_tx_clone = output_tx.clone();
                     active_workers += 1;
                     
                     tokio::spawn(async move {
-                        let mut worker = PeerWorker::new(peer_stream, torrent_clone, tx_clone, peer_addr);
+                        let mut worker = PeerWorker::new(peer_stream, torrent_clone, bitfield_tx_clone, output_tx_clone, peer_addr);
                         if let Err(e) = worker.start_worker().await {
                             println!("Worker for peer {} failed: {}", peer_addr, e);
                         }
@@ -135,16 +135,18 @@ impl TorrentClient {
 }
 
 impl PeerWorker {
-    pub fn new(stream: TcpStream, torrent: TorrentInfo, tx: Sender, peer_addr: SocketAddr) -> Self {
+    pub fn new(stream: TcpStream, torrent: TorrentInfo, bitfield_tx: BitfieldSender, output_tx: OutputSender, peer_addr: SocketAddr) -> Self {
         Self {
             stream,
             pending_requests: HashMap::new(),
             torrent,
-            tx,
+            bitfield_tx,
+            output_tx,
             peer_addr,
         }
     }
 
+    /// The main worker loop. Handles messages from the peer and manages piece requests.
     async fn start_worker(&mut self) -> Result<(), Error> {
         println!("Worker started for peer {}", self.peer_addr);
         let mut choked = true;
@@ -198,7 +200,7 @@ impl PeerWorker {
                     println!("Worker {}: Peer has {} out of {} pieces", 
                              self.peer_addr, peer_piece_count, self.torrent.pieces.len() / 20);
                     
-                    next_piece = get_requestable_piece(&self.tx, bitfield).await.unwrap();
+                    next_piece = get_requestable_piece(&self.bitfield_tx, bitfield).await.unwrap();
                     // Adjust size for the last piece.
                     if next_piece == Some((self.torrent.pieces.len() / 20) - 1) {
                         piece_size = self.torrent.length.unwrap_or(0) as usize % self.torrent.piece_length as usize;
@@ -241,13 +243,15 @@ impl PeerWorker {
                              self.peer_addr, received_index, begin, payload.len() - 8);
 
                     if self.received_all_blocks(piece_size) {
-                        if self.verify_piece(next_piece.unwrap() as u32, piece_buffer) {
+                        if self.verify_piece(next_piece.unwrap() as u32, &piece_buffer) {
                             // We have verified the piece, register it as completed.
-                            self.tx.send(BitfieldMsg::Have(next_piece.unwrap() as usize)).await.unwrap();
+                            self.bitfield_tx.send(BitfieldMsg::Have(next_piece.unwrap() as usize)).await.unwrap();
                             println!("Successfully downloaded and verified piece {}", next_piece.unwrap());
+                            // Send piece to output actor.
+                            self.output_tx.send(OutputMsg::Have((next_piece.unwrap(), piece_buffer))).await.unwrap();
                         } else {
                             // Piece verification failed, register piece as failed.
-                            self.tx.send(BitfieldMsg::PieceFailed(next_piece.unwrap() as u32)).await.unwrap();
+                            self.bitfield_tx.send(BitfieldMsg::PieceFailed(next_piece.unwrap() as u32)).await.unwrap();
                             println!("Piece verification failed for piece {}", next_piece.unwrap());
                         }
                         return Ok(());
@@ -292,7 +296,7 @@ impl PeerWorker {
         total >= piece_size
     }
 
-    fn verify_piece(&self, index: u32, piece_buffer: Vec<u8>) -> bool {
+    fn verify_piece(&self, index: u32, piece_buffer: &Vec<u8>) -> bool {
         let mut hasher = Sha1::new();
         hasher.update(piece_buffer);
         let result = hasher.finalize();

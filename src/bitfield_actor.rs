@@ -4,8 +4,8 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use crate::util::bitwise_and;
 
-pub type Receiver = mpsc::Receiver<BitfieldMsg>;
-pub type Sender = mpsc::Sender<BitfieldMsg>;
+pub type BitfieldReceiver = mpsc::Receiver<BitfieldMsg>;
+pub type BitfieldSender = mpsc::Sender<BitfieldMsg>;
 
 #[derive(Debug)]
 pub enum BitfieldMsg {
@@ -28,7 +28,7 @@ pub enum BitfieldMsg {
     PieceFailed(u32),
 }
 
-pub async fn bitfield_actor(mut rx: Receiver, mut bitfield: Box<[bool]>) {
+pub async fn bitfield_actor(mut rx: BitfieldReceiver, mut bitfield: Box<[bool]>) {
     let mut requested: Box<[bool]> = Box::from(vec![false; bitfield.len()]);
     let mut requestable: Box<[bool]> = bitfield.iter().map(|&x| !x).collect::<Vec<bool>>().into_boxed_slice();
 
@@ -84,7 +84,7 @@ pub async fn bitfield_actor(mut rx: Receiver, mut bitfield: Box<[bool]>) {
     }
 }
 
-pub async fn get_requestable_piece(tx: &Sender, peer_bitfield: Box<[bool]>) -> Result<Option<usize>, Error> {
+pub async fn get_requestable_piece(tx: &BitfieldSender, peer_bitfield: Box<[bool]>) -> Result<Option<usize>, Error> {
     let (resp_tx, resp_rx) = oneshot::channel();
     tx.send(BitfieldMsg::GetRequestablePiece(resp_tx, peer_bitfield)).await?;
     let piece = resp_rx.await?;
