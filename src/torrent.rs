@@ -9,6 +9,7 @@ use thiserror::Error;
 #[derive(Clone)]
 pub struct TorrentInfo {
     pub announce: String,
+    pub announce_list: Vec<String>,
     pub name: String,
     pub piece_length: u64,
     pub length: Option<u64>,
@@ -27,10 +28,31 @@ pub fn parse_torrent_file(path: &str) -> Result<TorrentInfo, Error> {
         _ => return Err(Error::InvalidTorrent("Top-level is not a dictionary".into())),
     };
 
+
     let announce = match dict.get(&b"announce"[..]) {
         Some(bendy::value::Value::Bytes(b)) => String::from_utf8_lossy(b).into_owned(),
         _ => return Err(Error::InvalidTorrent("Missing 'announce'".into())),
     };
+
+    // Parse announce-list if present
+    let mut announce_list = Vec::new();
+    if let Some(bendy::value::Value::List(tiers)) = dict.get(&b"announce-list"[..]) {
+        for tier in tiers {
+            if let bendy::value::Value::List(trackers) = tier {
+                for tracker in trackers {
+                    if let bendy::value::Value::Bytes(url) = tracker {
+                        announce_list.push(String::from_utf8_lossy(url).into_owned());
+                    }
+                }
+            }
+        }
+    }
+    // If announce-list is empty, add the main announce URL
+    if announce_list.is_empty() {
+        announce_list.push(announce.clone());
+    }
+
+    println!("Announce list: {:?}", announce_list);
 
     let info = match dict.get(&b"info"[..]) {
         Some(bendy::value::Value::Dict(d)) => d,
@@ -68,6 +90,7 @@ pub fn parse_torrent_file(path: &str) -> Result<TorrentInfo, Error> {
 
     Ok(TorrentInfo {
         announce,
+        announce_list,
         name,
         piece_length,
         length,

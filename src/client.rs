@@ -404,6 +404,9 @@ pub fn get_client_id() -> [u8; 20] {
 /// Fetch peers from the tracker.
 pub async fn fetch_peers(torrent_info: &TorrentInfo, id: [u8; 20]) -> Result<Vec<SocketAddr>, Error> {
     let client = Client::new();
+    let mut all_peers: Vec<SocketAddr> = Vec::new();
+    let mut seen: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
+
 
     let url = format!(
         "{}?info_hash={}&peer_id={}&port={}&uploaded=0&downloaded=0&left={}&compact=1",
