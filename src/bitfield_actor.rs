@@ -26,6 +26,9 @@ pub enum BitfieldMsg {
 
     // Register a piece as failed.
     PieceFailed(u32),
+
+    // Request allowance to download a piece.
+    RequestPiece(usize, oneshot::Sender<bool>),
 }
 
 pub async fn bitfield_actor(mut rx: BitfieldReceiver, mut bitfield: Box<[bool]>) {
@@ -79,6 +82,19 @@ pub async fn bitfield_actor(mut rx: BitfieldReceiver, mut bitfield: Box<[bool]>)
                     requested[index as usize] = false;
                     requestable[index as usize] = true;
                 }
+            }
+            // Request allowance to download a piece.
+            BitfieldMsg::RequestPiece(index, resp) => {
+                let can_request = if index < bitfield.len() {
+                    !bitfield[index] && !requested[index]
+                } else {
+                    false
+                };
+                if can_request {
+                    requested[index] = true;
+                    requestable[index] = false;
+                }
+                let _ = resp.send(can_request);
             }
         }
     }

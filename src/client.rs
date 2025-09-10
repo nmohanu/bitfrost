@@ -183,8 +183,16 @@ impl PeerWorker {
                     println!("Worker {}: Peer not interested", self.peer_addr);
                 }
                 4 => {
+                    println!("Worker {}: Received have message of {} bytes", self.peer_addr, payload.len());
+                    let received_index = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
                     // Have message, update bitfield.
-                    println!("Worker {}: Peer has piece", self.peer_addr);
+                    println!("Worker {}: Peer has piece {}", self.peer_addr, received_index);
+                    if next_piece.is_none() {
+                        let (resp_tx, mut resp_rx) = tokio::sync::oneshot::channel();
+                        if self.bitfield_tx.send(BitfieldMsg::RequestPiece(received_index, resp_tx)).await.is_ok() {
+                            next_piece = Some(received_index);
+                        }
+                    }
                 }
                 5 => {
                     // Bitfield message, update bitfield.
@@ -199,12 +207,14 @@ impl PeerWorker {
                     let peer_piece_count = bitfield.iter().filter(|&&x| x).count();
                     println!("Worker {}: Peer has {} out of {} pieces", 
                              self.peer_addr, peer_piece_count, self.torrent.pieces.len() / 20);
-                    
-                    next_piece = get_requestable_piece(&self.bitfield_tx, bitfield).await.unwrap();
-                    // Adjust size for the last piece.
-                    if next_piece == Some((self.torrent.pieces.len() / 20) - 1) {
-                        piece_size = self.torrent.length.unwrap_or(0) as usize % self.torrent.piece_length as usize;
-                        piece_buffer = vec![0; piece_size];
+
+                    if next_piece.is_none() {
+                        next_piece = get_requestable_piece(&self.bitfield_tx, bitfield).await.unwrap();
+                        // Adjust size for the last piece.
+                        if next_piece == Some((self.torrent.pieces.len() / 20) - 1) {
+                            piece_size = self.torrent.length.unwrap_or(0) as usize % self.torrent.piece_length as usize;
+                            piece_buffer = vec![0; piece_size];
+                        }
                     }
 
                     if next_piece.is_none() {
