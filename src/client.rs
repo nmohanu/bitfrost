@@ -40,6 +40,7 @@ pub struct PeerWorker {
     bitfield_tx: BitfieldSender,
     output_tx: OutputSender,
     peer_addr: SocketAddr,
+    peer_bitfield: Option<Box<[bool]>>,
 }
 
 /// The state for the download client. 
@@ -90,68 +91,96 @@ impl TorrentClient {
     /// Download the entire file.
     /// Here we manage peer connections and spawn workers.
     async fn download_file(&self, bitfield_tx: BitfieldSender, output_tx: OutputSender) -> Result<(), Error> {
-        let peer_id = get_client_id();
-
-        // Fetch peers from tracker.
-        let mut peers = fetch_peers(&self.torrent, peer_id).await?;
-        println!("Total peers discovered: {}", peers.len());
-
         use futures::stream::{FuturesUnordered, StreamExt};
-        let mut active_workers = FuturesUnordered::new();
-        let mut peer_iter = peers.drain(..);
+        use tokio::sync::oneshot;
+        let peer_id = get_client_id();
         let info_hash = self.torrent.info_hash;
 
-        // Start up to MAX_CONCURRENT_PEERS workers.
-        for _ in 0..MAX_CONCURRENT_PEERS {
-            if let Some(peer_addr) = peer_iter.next() {
-                let torrent_clone = self.torrent.clone();
-                let bitfield_tx_clone = bitfield_tx.clone();
-                let output_tx_clone = output_tx.clone();
-                let info_hash = info_hash;
-                let peer_id = peer_id;
-                active_workers.push(tokio::spawn(async move {
-                    match perform_handshake(&peer_addr, info_hash, peer_id).await {
-                        Ok(peer_stream) => {
-                            let mut worker = PeerWorker::new(peer_stream, torrent_clone, bitfield_tx_clone, output_tx_clone, peer_addr);
-                            if let Err(e) = worker.start_worker().await {
-                                println!("Worker for peer {} failed: {}", peer_addr, e);
-                            }
-                            println!("Worker for peer {} finished", peer_addr);
-                        }
-                        Err(e) => {
-                            println!("Failed to connect to peer {}: {}", peer_addr, e);
-                        }
-                    }
-                }));
+        loop {
+            // Check if download is complete by asking the bitfield actor.
+            let (resp_tx, resp_rx) = oneshot::channel();
+            if bitfield_tx.send(BitfieldMsg::IsComplete(resp_tx)).await.is_err() {
+                return Err(Error::StartError("Bitfield actor dropped".to_string()));
             }
-        }
-
-        // As each worker finishes, spawn a new one until all peers are tried.
-        while let Some(_res) = active_workers.next().await {
-            if let Some(peer_addr) = peer_iter.next() {
-                let torrent_clone = self.torrent.clone();
-                let bitfield_tx_clone = bitfield_tx.clone();
-                let output_tx_clone = output_tx.clone();
-                let info_hash = info_hash;
-                let peer_id = peer_id;
-                active_workers.push(tokio::spawn(async move {
-                    match perform_handshake(&peer_addr, info_hash, peer_id).await {
-                        Ok(peer_stream) => {
-                            let mut worker = PeerWorker::new(peer_stream, torrent_clone, bitfield_tx_clone, output_tx_clone, peer_addr);
-                            if let Err(e) = worker.start_worker().await {
-                                println!("Worker for peer {} failed: {}", peer_addr, e);
-                            }
-                            println!("Worker for peer {} finished", peer_addr);
-                        }
-                        Err(e) => {
-                            println!("Failed to connect to peer {}: {}", peer_addr, e);
-                        }
-                    }
-                }));
+            if let Ok(true) = resp_rx.await {
+                println!("Download complete!");
+                break;
             }
-        }
 
-        println!("All peers have been tried or all workers finished.");
+            // Fetch peers from tracker and DHT.
+            let mut peers = match fetch_peers(&self.torrent, peer_id).await {
+                Ok(p) => p,
+                Err(e) => {
+                    println!("Error fetching peers: {}. Retrying...", e);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+            println!("Total peers discovered: {}", peers.len());
+
+            if peers.is_empty() {
+                println!("No peers found. Retrying in 10 seconds...");
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                continue;
+            }
+
+            let mut active_workers = FuturesUnordered::new();
+            let mut peer_iter = peers.drain(..);
+
+            // Start up to MAX_CONCURRENT_PEERS workers.
+            for _ in 0..MAX_CONCURRENT_PEERS {
+                if let Some(peer_addr) = peer_iter.next() {
+                    let torrent_clone = self.torrent.clone();
+                    let bitfield_tx_clone = bitfield_tx.clone();
+                    let output_tx_clone = output_tx.clone();
+                    let info_hash = info_hash;
+                    let peer_id = peer_id;
+                    active_workers.push(tokio::spawn(async move {
+                        match perform_handshake(&peer_addr, info_hash, peer_id).await {
+                            Ok(peer_stream) => {
+                                let mut worker = PeerWorker::new(peer_stream, torrent_clone, bitfield_tx_clone, output_tx_clone, peer_addr);
+                                if let Err(e) = worker.start_worker().await {
+                                    println!("Worker for peer {} failed: {}", peer_addr, e);
+                                }
+                                println!("Worker for peer {} finished", peer_addr);
+                            }
+                            Err(e) => {
+                                println!("Failed to connect to peer {}: {}", peer_addr, e);
+                            }
+                        }
+                    }));
+                }
+            }
+
+            // As each worker finishes, spawn a new one until all peers are tried.
+            while let Some(_res) = active_workers.next().await {
+                if let Some(peer_addr) = peer_iter.next() {
+                    let torrent_clone = self.torrent.clone();
+                    let bitfield_tx_clone = bitfield_tx.clone();
+                    let output_tx_clone = output_tx.clone();
+                    let info_hash = info_hash;
+                    let peer_id = peer_id;
+                    active_workers.push(tokio::spawn(async move {
+                        match perform_handshake(&peer_addr, info_hash, peer_id).await {
+                            Ok(peer_stream) => {
+                                let mut worker = PeerWorker::new(peer_stream, torrent_clone, bitfield_tx_clone, output_tx_clone, peer_addr);
+                                if let Err(e) = worker.start_worker().await {
+                                    println!("Worker for peer {} failed: {}", peer_addr, e);
+                                }
+                                println!("Worker for peer {} finished", peer_addr);
+                            }
+                            Err(e) => {
+                                println!("Failed to connect to peer {}: {}", peer_addr, e);
+                            }
+                        }
+                    }));
+                }
+            }
+
+            println!("All peers have been tried or all workers finished. Checking for completion...");
+            // Wait a short time before retrying to avoid hammering trackers.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
         Ok(())
     }
 }
@@ -165,6 +194,7 @@ impl PeerWorker {
             bitfield_tx,
             output_tx,
             peer_addr,
+            peer_bitfield: None,
         }
     }
 
@@ -177,16 +207,29 @@ impl PeerWorker {
         let mut piece_size = self.torrent.piece_length as usize;
 
         loop {
-            let message = read_peer_message(&mut self.stream).await;
-            if message.is_err() {
-                println!("Connection to peer {} lost: {}", self.peer_addr, message.err().unwrap());
-                if(next_piece.is_some()) {
-                    // If we were in the middle of downloading a piece, mark it as failed.
+            let message_result = if choked {
+                match tokio::time::timeout(Duration::from_secs(60), read_peer_message(&mut self.stream)).await {
+                    Ok(res) => res,
+                    Err(_) => {
+                        println!("Connection to peer {} timed out", self.peer_addr);
+                        if next_piece.is_some() {
+                            self.bitfield_tx.send(BitfieldMsg::PieceFailed(next_piece.unwrap() as u32)).await.unwrap();
+                        }
+                        return Ok(());
+                    }
+                }
+            } else {
+                read_peer_message(&mut self.stream).await
+            };
+
+            if let Err(e) = &message_result {
+                println!("Connection to peer {} lost: {}", self.peer_addr, e);
+                if next_piece.is_some() {
                     self.bitfield_tx.send(BitfieldMsg::PieceFailed(next_piece.unwrap() as u32)).await.unwrap();
                 }
                 return Ok(());
             }
-            let (payload_id, payload) = message.unwrap();
+            let (payload_id, payload) = message_result.unwrap();
             println!("Worker {}: Received message type {}", self.peer_addr, payload_id);
             
             match payload_id {
@@ -228,14 +271,14 @@ impl PeerWorker {
                     println!("Worker {}: Raw bitfield: {:02x?}", self.peer_addr, &payload[..std::cmp::min(4, payload.len())]);
                     
                     let bitfield = vec_u8_to_box_bool(payload.to_vec());
-                    
+                    self.peer_bitfield = Some(bitfield);
                     // Debug: count how many pieces the peer has
-                    let peer_piece_count = bitfield.iter().filter(|&&x| x).count();
-                    println!("Worker {}: Peer has {} out of {} pieces", 
+                    let peer_piece_count = self.peer_bitfield.as_ref().unwrap().iter().filter(|&&x| x).count();
+                    println!("Worker {}: Peer has {} out of {} pieces",
                              self.peer_addr, peer_piece_count, self.torrent.pieces.len() / 20);
 
                     if next_piece.is_none() {
-                        next_piece = get_requestable_piece(&self.bitfield_tx, bitfield).await.unwrap();
+                        next_piece = get_requestable_piece(&self.bitfield_tx, self.peer_bitfield.as_ref().unwrap().clone()).await.unwrap();
                         // Adjust size for the last piece.
                         if next_piece == Some((self.torrent.pieces.len() / 20) - 1) {
                             piece_size = self.torrent.length.unwrap_or(0) as usize % self.torrent.piece_length as usize;
@@ -285,12 +328,22 @@ impl PeerWorker {
                             println!("Successfully downloaded and verified piece {}", next_piece.unwrap());
                             // Send piece to output actor.
                             self.output_tx.send(OutputMsg::Have((next_piece.unwrap(), piece_buffer))).await.unwrap();
+                            // Reset for next piece.
+                            next_piece = None;
+                            piece_buffer = vec![0; self.torrent.piece_length as usize];
+                            // Try to request another piece.
+                            next_piece = get_requestable_piece(&self.bitfield_tx, self.peer_bitfield.as_ref().unwrap().clone()).await.unwrap();
+
                         } else {
                             // Piece verification failed, register piece as failed.
                             self.bitfield_tx.send(BitfieldMsg::PieceFailed(next_piece.unwrap() as u32)).await.unwrap();
                             println!("Piece verification failed for piece {}", next_piece.unwrap());
+                            if(next_piece.is_some()) {
+                                // If we were in the middle of downloading a piece, mark it as failed.
+                                self.bitfield_tx.send(BitfieldMsg::PieceFailed(next_piece.unwrap() as u32)).await.unwrap();
+                            }
+                            return Ok(());
                         }
-                        return Ok(());
                     }
                 }
                 8 => {

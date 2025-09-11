@@ -29,6 +29,9 @@ pub enum BitfieldMsg {
 
     // Request allowance to download a piece.
     RequestPiece(usize, oneshot::Sender<bool>),
+
+    // Check whether we are done.
+    IsComplete(oneshot::Sender<bool>),
 }
 
 pub async fn bitfield_actor(mut rx: BitfieldReceiver, mut bitfield: Box<[bool]>) {
@@ -42,6 +45,8 @@ pub async fn bitfield_actor(mut rx: BitfieldReceiver, mut bitfield: Box<[bool]>)
                 if index < bitfield.len() {
                     bitfield[index] = true;
                 }
+                println!("Bitfield actor: Marked piece {} as completed", index);
+                println!("Pieces done: {}/{}", bitfield.iter().filter(|&&x| x).count(), bitfield.len());
             }
             // Return a snapshot of the current bitfield.
             BitfieldMsg::Get(resp) => {
@@ -57,6 +62,7 @@ pub async fn bitfield_actor(mut rx: BitfieldReceiver, mut bitfield: Box<[bool]>)
             BitfieldMsg::Requested(index) => {
                 if index < bitfield.len() {
                     requested[index] = true;
+                    requestable[index] = false;
                 }
             }
             // Return a requestable piece index, or None if no pieces available.
@@ -95,6 +101,11 @@ pub async fn bitfield_actor(mut rx: BitfieldReceiver, mut bitfield: Box<[bool]>)
                     requestable[index] = false;
                 }
                 let _ = resp.send(can_request);
+            }
+            // Check whether all pieces are completed.
+            BitfieldMsg::IsComplete(resp) => {
+                let complete = bitfield.iter().all(|&x| x);
+                let _ = resp.send(complete);
             }
         }
     }
