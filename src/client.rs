@@ -329,7 +329,6 @@ impl PeerWorker {
                             // Send piece to output actor.
                             self.output_tx.send(OutputMsg::Have((next_piece.unwrap(), piece_buffer))).await.unwrap();
                             // Reset for next piece.
-                            next_piece = None;
                             piece_buffer = vec![0; self.torrent.piece_length as usize];
                             // Try to request another piece.
                             next_piece = get_requestable_piece(&self.bitfield_tx, self.peer_bitfield.as_ref().unwrap().clone()).await.unwrap();
@@ -338,7 +337,7 @@ impl PeerWorker {
                             // Piece verification failed, register piece as failed.
                             self.bitfield_tx.send(BitfieldMsg::PieceFailed(next_piece.unwrap() as u32)).await.unwrap();
                             println!("Piece verification failed for piece {}", next_piece.unwrap());
-                            if(next_piece.is_some()) {
+                            if next_piece.is_some() {
                                 // If we were in the middle of downloading a piece, mark it as failed.
                                 self.bitfield_tx.send(BitfieldMsg::PieceFailed(next_piece.unwrap() as u32)).await.unwrap();
                             }
@@ -363,7 +362,7 @@ impl PeerWorker {
 
                 if let Err(e) = self.request_block(next_piece.unwrap(), block_to_request.unwrap(), piece_size).await {
                     println!("Worker {}: Failed to request block: {}", self.peer_addr, e);
-                    if(next_piece.is_some()) {
+                    if next_piece.is_some() {
                         // If we were in the middle of downloading a piece, mark it as failed.
                         self.bitfield_tx.send(BitfieldMsg::PieceFailed(next_piece.unwrap() as u32)).await.unwrap();
                     }
@@ -641,40 +640,6 @@ pub async fn fetch_peers(torrent_info: &TorrentInfo, id: [u8; 20]) -> Result<Vec
         all_peers.push(peer);
     }
     Ok(all_peers)
-}
-
-pub fn create_udp_request(info_hash: &[u8; 20], peer_id: &[u8; 20]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(98);
-    // Connection ID (8 bytes).
-    buf.extend_from_slice(&0x41727101980u64.to_be_bytes());
-    // Action (4 bytes) - 0 for connect.
-    buf.extend_from_slice(&0u32.to_be_bytes());
-    // Transaction ID (4 bytes) - random.
-    let transaction_id: u32 = rand::random();
-    buf.extend_from_slice(&transaction_id.to_be_bytes());
-    // Info hash (20 bytes).
-    buf.extend_from_slice(info_hash);
-    // Peer ID (20 bytes).
-    buf.extend_from_slice(peer_id);
-    // Downloaded (8 bytes).
-    buf.extend_from_slice(&0u64.to_be_bytes());
-    // Left (8 bytes).
-    buf.extend_from_slice(&0u64.to_be_bytes());
-    // Uploaded (8 bytes).
-    buf.extend_from_slice(&0u64.to_be_bytes());
-    // Event (4 bytes) - 0 for none.
-    buf.extend_from_slice(&0u32.to_be_bytes());
-    // IP address (4 bytes) - 0 for default.
-    buf.extend_from_slice(&0u32.to_be_bytes());
-    // Key (4 bytes) - random.
-    let key: u32 = rand::random();
-    buf.extend_from_slice(&key.to_be_bytes());
-    // Num want (4 bytes) - -1 for default.
-    buf.extend_from_slice(&(-1i32).to_be_bytes());
-    // Port (2 bytes).
-    buf.extend_from_slice(&DEFAULT_PORT.to_be_bytes());
-    
-    buf
 }
 
 #[derive(Error, Debug)]
