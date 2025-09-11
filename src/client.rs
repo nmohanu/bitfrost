@@ -1,6 +1,7 @@
 use sha1::{Digest, Sha1};
 
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpStream, UdpSocket}};
+use tokio::time::{timeout, Duration};
 
 use thiserror::Error;
 use reqwest::Client;
@@ -408,27 +409,26 @@ pub async fn fetch_peers(torrent_info: &TorrentInfo, id: [u8; 20]) -> Result<Vec
     let mut all_peers: Vec<SocketAddr> = Vec::new();
     let mut seen: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
 
-    for announce in torrent_info.announce_list.clone() {
+    for announce in &torrent_info.announce_list {
         // We need to check whether announce is https or udp.
         if announce.starts_with("udp://") {
-            // Announcer is udp.
-            // Initialize connection to UDP tracker.
-            let addr: SocketAddr = UdpSocket::bind("0.0.0.0:0").await.unwrap().local_addr().unwrap();
-            println!("Contacting UDP tracker at {}", announce);
-            let socket = UdpSocket::bind(addr).await.unwrap();
-            socket.connect(&announce).await.unwrap();
-            
-            // Parse response.
-            /* 
-            let peers = parse_udp_response(response);
-            for peer in peers {
-                if seen.contains(&peer) {
-                    continue;
-                }
-                seen.insert(peer);
-                all_peers.push(peer);
-            } 
-            */
+           let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+
+            // Build connect request
+            let mut conn_request = [0u8; 16];
+            conn_request[..8].copy_from_slice(&0x41727101980u64.to_be_bytes()); // protocol ID
+            conn_request[8..12].copy_from_slice(&0u32.to_be_bytes());           // action: connect
+            let transaction_id: u32 = rand::random();
+            conn_request[12..16].copy_from_slice(&transaction_id.to_be_bytes()); // transaction ID
+
+            // Send
+            let sent = socket.send_to(&conn_request, announce).await.unwrap();
+            println!("Sent {} bytes to {}", sent, announce);
+
+            // Receive
+            let mut buf = [0u8; 512];
+            let (len, from) = socket.recv_from(&mut buf).await.unwrap();
+            println!("Got {} bytes from {}", len, from); 
         } else if announce.starts_with("http://") || announce.starts_with("https://") {
             // Announcer is http(s).
             let url = format!(
