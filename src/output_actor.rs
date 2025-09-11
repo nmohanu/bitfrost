@@ -16,7 +16,7 @@ pub async fn output_actor(mut rx: OutputReceiver, torrent: TorrentInfo) {
     let file_name = format!("./{}", torrent.name);
     let piece_length = torrent.piece_length as usize;
     let total_length = torrent.length.unwrap_or(0) as usize;
-    let num_pieces = (total_length + piece_length - 1) / piece_length;
+    let num_pieces = torrent.pieces.len() / 20;
 
     // Open the file for writing.
     let mut file = tokio::fs::OpenOptions::new()
