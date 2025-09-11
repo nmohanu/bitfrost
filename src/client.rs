@@ -1,6 +1,6 @@
 use sha1::{Digest, Sha1};
 
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpStream, UdpSocket}};
 
 use thiserror::Error;
 use reqwest::Client;
@@ -409,39 +409,65 @@ pub async fn fetch_peers(torrent_info: &TorrentInfo, id: [u8; 20]) -> Result<Vec
     let mut seen: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
 
     for announce in torrent_info.announce_list.clone() {
-        let url = format!(
-            "{}?info_hash={}&peer_id={}&port={}&uploaded=0&downloaded=0&left={}&compact=1",
-            announce,
-            urlencoding::encode_binary(&torrent_info.info_hash),
-            urlencoding::encode_binary(&id),
-            DEFAULT_PORT,
-            torrent_info.length.unwrap_or(0)
-        );
-        println!("Sending out: {}", url);
+        // We need to check whether announce is https or udp.
+        if announce.starts_with("udp://") {
+            // Announcer is udp.
+            // Initialize connection to UDP tracker.
+            let addr: SocketAddr = UdpSocket::bind("0.0.0.0:0").await.unwrap().local_addr().unwrap();
+            println!("Contacting UDP tracker at {}", announce);
+            let socket = UdpSocket::bind(addr).await.unwrap();
+            socket.connect(&announce).await.unwrap();
+            
+            // Parse response.
+            /* 
+            let peers = parse_udp_response(response);
+            for peer in peers {
+                if seen.contains(&peer) {
+                    continue;
+                }
+                seen.insert(peer);
+                all_peers.push(peer);
+            } 
+            */
+        } else if announce.starts_with("http://") || announce.starts_with("https://") {
+            // Announcer is http(s).
+            let url = format!(
+                "{}?info_hash={}&peer_id={}&port={}&uploaded=0&downloaded=0&left={}&compact=1",
+                announce,
+                urlencoding::encode_binary(&torrent_info.info_hash),
+                urlencoding::encode_binary(&id),
+                DEFAULT_PORT,
+                torrent_info.length.unwrap_or(0)
+            );
+            println!("Sending out: {}", url);
 
-        // Send the GET request to the tracker.
-        let response = client.get(&url).send().await?.bytes().await?;
+            // Send the GET request to the tracker.
+            let response = client.get(&url).send().await?.bytes().await?;
 
-        let bencode = BencodeRef::decode(&response, BDecodeOpt::default())
-        .map_err(|e| Error::StartError(format!("Bencode decoding error: {}", e)))?;
+            let bencode = BencodeRef::decode(&response, BDecodeOpt::default())
+                .map_err(|e| Error::StartError(format!("Bencode decoding error: {}", e)))?;
 
-        let dict = bencode.dict()
-        .ok_or_else(|| Error::StartError("Expected dictionary response".into()))?;
+            let dict = bencode.dict()
+                .ok_or_else(|| Error::StartError("Expected dictionary response".into()))?;
 
-        let peers_bytes = dict.lookup(b"peers")
-        .and_then(|p| p.bytes())
-        .ok_or_else(|| Error::StartError("Missing 'peers' field".into()))?;
+            let peers_bytes = dict.lookup(b"peers")
+                .and_then(|p| p.bytes())
+                .ok_or_else(|| Error::StartError("Missing 'peers' field".into()))?;
 
-        // Parse the compact peer list.
-        for chunk in peers_bytes.chunks_exact(6) {
-            let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
-            let port = u16::from_be_bytes([chunk[4], chunk[5]]);
-            let peer = SocketAddr::new(ip.into(), port);
-            if seen.contains(&peer) {
-                continue;
+            // Parse the compact peer list.
+            for chunk in peers_bytes.chunks_exact(6) {
+                let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
+                let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+                let peer = SocketAddr::new(ip.into(), port);
+                if seen.contains(&peer) {
+                    continue;
+                }
+                seen.insert(peer);
+                all_peers.push(peer);
             }
-            seen.insert(peer);
-            all_peers.push(peer);
+        } else {
+            println!("Unsupported tracker protocol in announce URL: {}", announce);
+            continue;
         }
     }
 
@@ -455,6 +481,40 @@ pub async fn fetch_peers(torrent_info: &TorrentInfo, id: [u8; 20]) -> Result<Vec
         all_peers.push(peer);
     }
     Ok(all_peers)
+}
+
+pub fn create_udp_request(info_hash: &[u8; 20], peer_id: &[u8; 20]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(98);
+    // Connection ID (8 bytes).
+    buf.extend_from_slice(&0x41727101980u64.to_be_bytes());
+    // Action (4 bytes) - 0 for connect.
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    // Transaction ID (4 bytes) - random.
+    let transaction_id: u32 = rand::random();
+    buf.extend_from_slice(&transaction_id.to_be_bytes());
+    // Info hash (20 bytes).
+    buf.extend_from_slice(info_hash);
+    // Peer ID (20 bytes).
+    buf.extend_from_slice(peer_id);
+    // Downloaded (8 bytes).
+    buf.extend_from_slice(&0u64.to_be_bytes());
+    // Left (8 bytes).
+    buf.extend_from_slice(&0u64.to_be_bytes());
+    // Uploaded (8 bytes).
+    buf.extend_from_slice(&0u64.to_be_bytes());
+    // Event (4 bytes) - 0 for none.
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    // IP address (4 bytes) - 0 for default.
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    // Key (4 bytes) - random.
+    let key: u32 = rand::random();
+    buf.extend_from_slice(&key.to_be_bytes());
+    // Num want (4 bytes) - -1 for default.
+    buf.extend_from_slice(&(-1i32).to_be_bytes());
+    // Port (2 bytes).
+    buf.extend_from_slice(&DEFAULT_PORT.to_be_bytes());
+    
+    buf
 }
 
 #[derive(Error, Debug)]
