@@ -95,43 +95,35 @@ impl TorrentClient {
         // Fetch peers from tracker.
         let peers = fetch_peers(&self.torrent, peer_id).await?;
 
-        // Keep track of active workers and available peers.
-        let mut active_workers = 0;
-        let mut peer_index = 0;
         let target_workers = std::cmp::min(peers.len(), MAX_CONCURRENT_PEERS);
-        
         println!("Target: {} concurrent workers from {} total peers", target_workers, peers.len());
 
-        // Connect to peers and spawn workers. If a worker fails, try to replace it.
-        while active_workers < target_workers && peer_index < peers.len() {
-            let peer_addr = peers[peer_index];
-            peer_index += 1;
-
-            match perform_handshake(&peer_addr, self.torrent.info_hash, peer_id).await {
-                Ok(peer_stream) => {
-                    let torrent_clone = self.torrent.clone();
-                    let bitfield_tx_clone = bitfield_tx.clone();
-                    let output_tx_clone = output_tx.clone();
-                    active_workers += 1;
-                    
-                    tokio::spawn(async move {
+        let mut handles = Vec::new();
+        for peer_addr in peers.into_iter().take(target_workers) {
+            let torrent_clone = self.torrent.clone();
+            let bitfield_tx_clone = bitfield_tx.clone();
+            let output_tx_clone = output_tx.clone();
+            let info_hash = self.torrent.info_hash;
+            let peer_id = peer_id;
+            handles.push(tokio::spawn(async move {
+                match perform_handshake(&peer_addr, info_hash, peer_id).await {
+                    Ok(peer_stream) => {
                         let mut worker = PeerWorker::new(peer_stream, torrent_clone, bitfield_tx_clone, output_tx_clone, peer_addr);
                         if let Err(e) = worker.start_worker().await {
                             println!("Worker for peer {} failed: {}", peer_addr, e);
                         }
                         println!("Worker for peer {} finished", peer_addr);
-                    });
+                    }
+                    Err(e) => {
+                        println!("Failed to connect to peer {}: {}", peer_addr, e);
+                    }
                 }
-                Err(e) => {
-                    println!("Failed to connect to peer {}: {}", peer_addr, e);
-                }
-            }
+            }));
         }
-        
-        // For now, wait and see worker output.
-        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+
+        // Wait for all workers to finish or timeout.
+        tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
         println!("Download timeout reached");
-        
         Ok(())
     }
 }
@@ -405,69 +397,147 @@ pub fn get_client_id() -> [u8; 20] {
 
 /// Fetch peers from the tracker.
 pub async fn fetch_peers(torrent_info: &TorrentInfo, id: [u8; 20]) -> Result<Vec<SocketAddr>, Error> {
+    use futures::future::join_all;
     let client = Client::new();
-    let mut all_peers: Vec<SocketAddr> = Vec::new();
-    let mut seen: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
+    let mut tasks = Vec::new();
 
     for announce in &torrent_info.announce_list {
-        // We need to check whether announce is https or udp.
-        if announce.starts_with("udp://") {
-           let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let announce = announce.clone();
+        let torrent_info = torrent_info.clone();
+        let id = id.clone();
+        let client = client.clone();
 
-            // Build connect request
-            let mut conn_request = [0u8; 16];
-            conn_request[..8].copy_from_slice(&0x41727101980u64.to_be_bytes()); // protocol ID
-            conn_request[8..12].copy_from_slice(&0u32.to_be_bytes());           // action: connect
-            let transaction_id: u32 = rand::random();
-            conn_request[12..16].copy_from_slice(&transaction_id.to_be_bytes()); // transaction ID
+        // Spawn a task for each announce URL.
+        tasks.push(tokio::spawn(async move {
+            let mut peers: Vec<SocketAddr> = Vec::new();
+            // Check if it's UDP or HTTP tracker.
+            if announce.starts_with("udp://") {
+                // UDP tracker protocol.
+                // Resolve the hostname.
+                let socket_addr_str = announce.trim_start_matches("udp://").split('/').next().unwrap_or("");
+                let mut addrs_iter = match tokio::net::lookup_host(socket_addr_str).await {
+                    Ok(iter) => iter,
+                    Err(_) => return peers,
+                };
+                let resolved_addr = match addrs_iter.next() {
+                    Some(addr) => addr,
+                    None => return peers,
+                };
+                let socket = match UdpSocket::bind("0.0.0.0:0").await {
+                    Ok(s) => s,
+                    Err(_) => return peers,
+                };
 
-            // Send
-            let sent = socket.send_to(&conn_request, announce).await.unwrap();
-            println!("Sent {} bytes to {}", sent, announce);
+                // Construct connection request.
+                let mut conn_request = [0u8; 16];
+                conn_request[..8].copy_from_slice(&0x41727101980u64.to_be_bytes());
+                conn_request[8..12].copy_from_slice(&0u32.to_be_bytes());
+                let conn_transaction_id: u32 = rand::random();
+                conn_request[12..16].copy_from_slice(&conn_transaction_id.to_be_bytes());
+                let _ = socket.send_to(&conn_request, resolved_addr).await;
 
-            // Receive
-            let mut buf = [0u8; 512];
-            let (len, from) = socket.recv_from(&mut buf).await.unwrap();
-            println!("Got {} bytes from {}", len, from); 
-        } else if announce.starts_with("http://") || announce.starts_with("https://") {
-            // Announcer is http(s).
-            let url = format!(
-                "{}?info_hash={}&peer_id={}&port={}&uploaded=0&downloaded=0&left={}&compact=1",
-                announce,
-                urlencoding::encode_binary(&torrent_info.info_hash),
-                urlencoding::encode_binary(&id),
-                DEFAULT_PORT,
-                torrent_info.length.unwrap_or(0)
-            );
-            println!("Sending out: {}", url);
+                // Send and receive connection response.
+                let mut buf = [0u8; 512];
+                let (len, _) = match timeout(Duration::from_secs(3), socket.recv_from(&mut buf)).await {
+                    Ok(Ok(res)) => res,
+                    _ => return peers,
+                };
+                if len < 16 { return peers; }
 
-            // Send the GET request to the tracker.
-            let response = client.get(&url).send().await?.bytes().await?;
+                // Parse connection response.
+                let action = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let transaction_id = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                if action != 0 || transaction_id != conn_transaction_id { return peers; }
+                let connection_id = &buf[8..16];
 
-            let bencode = BencodeRef::decode(&response, BDecodeOpt::default())
-                .map_err(|e| Error::StartError(format!("Bencode decoding error: {}", e)))?;
+                // Construct announce request.
+                let mut announce_req = Vec::with_capacity(98);
+                announce_req.extend_from_slice(connection_id);
+                announce_req.extend_from_slice(&1u32.to_be_bytes());
+                let announce_transaction_id: u32 = rand::random();
+                announce_req.extend_from_slice(&announce_transaction_id.to_be_bytes());
+                announce_req.extend_from_slice(&torrent_info.info_hash);
+                announce_req.extend_from_slice(&id);
+                announce_req.extend_from_slice(&0u64.to_be_bytes());
+                let left = torrent_info.length.unwrap_or(0);
+                announce_req.extend_from_slice(&(left as u64).to_be_bytes());
+                announce_req.extend_from_slice(&0u64.to_be_bytes());
+                announce_req.extend_from_slice(&0u32.to_be_bytes());
+                announce_req.extend_from_slice(&0u32.to_be_bytes());
+                let key: u32 = rand::random();
+                announce_req.extend_from_slice(&key.to_be_bytes());
+                announce_req.extend_from_slice(&(-1i32).to_be_bytes());
+                announce_req.extend_from_slice(&DEFAULT_PORT.to_be_bytes());
 
-            let dict = bencode.dict()
-                .ok_or_else(|| Error::StartError("Expected dictionary response".into()))?;
-
-            let peers_bytes = dict.lookup(b"peers")
-                .and_then(|p| p.bytes())
-                .ok_or_else(|| Error::StartError("Missing 'peers' field".into()))?;
-
-            // Parse the compact peer list.
-            for chunk in peers_bytes.chunks_exact(6) {
-                let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
-                let port = u16::from_be_bytes([chunk[4], chunk[5]]);
-                let peer = SocketAddr::new(ip.into(), port);
-                if seen.contains(&peer) {
-                    continue;
+                // Send announce request and receive response.
+                let _ = socket.send_to(&announce_req, resolved_addr).await;
+                let mut buf2 = [0u8; 4096];
+                let (len2, _) = match timeout(Duration::from_secs(3), socket.recv_from(&mut buf2)).await {
+                    Ok(Ok(res)) => res,
+                    _ => return peers,
+                };
+                // Parse announce response.
+                if len2 < 20 { return peers; }
+                let action2 = u32::from_be_bytes([buf2[0], buf2[1], buf2[2], buf2[3]]);
+                if action2 != 1 { return peers; }
+                let peers_bytes = &buf2[20..len2];
+                for chunk in peers_bytes.chunks_exact(6) {
+                    let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
+                    let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+                    let peer = SocketAddr::new(ip.into(), port);
+                    peers.push(peer);
                 }
+                println!("UDP tracker {} returned {} peers", announce, peers.len());
+            } else if announce.starts_with("http://") || announce.starts_with("https://") {
+                // Construct HTTP GET request.
+                let url = format!(
+                    "{}?info_hash={}&peer_id={}&port={}&uploaded=0&downloaded=0&left={}&compact=1",
+                    announce,
+                    urlencoding::encode_binary(&torrent_info.info_hash),
+                    urlencoding::encode_binary(&id),
+                    DEFAULT_PORT,
+                    torrent_info.length.unwrap_or(0)
+                );
+                // Send GET request.
+                let response = match client.get(&url).send().await {
+                    Ok(resp) => match resp.bytes().await { Ok(b) => b, Err(_) => return peers },
+                    Err(_) => return peers,
+                };
+                // Parse bencoded response.
+                let bencode = match BencodeRef::decode(&response, BDecodeOpt::default()) {
+                    Ok(b) => b,
+                    Err(_) => return peers,
+                };
+                let dict = match bencode.dict() {
+                    Some(d) => d,
+                    None => return peers,
+                };
+                let peers_bytes = match dict.lookup(b"peers").and_then(|p| p.bytes()) {
+                    Some(p) => p,
+                    None => return peers,
+                };
+                // Parse peers to list.
+                for chunk in peers_bytes.chunks_exact(6) {
+                    let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
+                    let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+                    let peer = SocketAddr::new(ip.into(), port);
+                    peers.push(peer);
+                }
+            }
+            peers
+        }));
+    }
+
+    let results = join_all(tasks).await;
+    let mut all_peers: Vec<SocketAddr> = Vec::new();
+    let mut seen: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
+    for res in results {
+        if let Ok(peers) = res {
+            for peer in peers {
+                if seen.contains(&peer) { continue; }
                 seen.insert(peer);
                 all_peers.push(peer);
             }
-        } else {
-            println!("Unsupported tracker protocol in announce URL: {}", announce);
-            continue;
         }
     }
 
