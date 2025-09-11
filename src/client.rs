@@ -407,39 +407,43 @@ pub async fn fetch_peers(torrent_info: &TorrentInfo, id: [u8; 20]) -> Result<Vec
     let mut all_peers: Vec<SocketAddr> = Vec::new();
     let mut seen: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
 
+    for announce in torrent_info.announce_list.clone() {
+        let url = format!(
+            "{}?info_hash={}&peer_id={}&port={}&uploaded=0&downloaded=0&left={}&compact=1",
+            announce,
+            urlencoding::encode_binary(&torrent_info.info_hash),
+            urlencoding::encode_binary(&id),
+            DEFAULT_PORT,
+            torrent_info.length.unwrap_or(0)
+        );
+        println!("Sending out: {}", url);
 
-    let url = format!(
-        "{}?info_hash={}&peer_id={}&port={}&uploaded=0&downloaded=0&left={}&compact=1",
-        torrent_info.announce,
-        urlencoding::encode_binary(&torrent_info.info_hash),
-        urlencoding::encode_binary(&id),
-        DEFAULT_PORT,
-        torrent_info.length.unwrap_or(0)
-    );
+        // Send the GET request to the tracker.
+        let response = client.get(&url).send().await?.bytes().await?;
 
-    println!("Sending out: {}", url);
-
-    // Send the GET request to the tracker.
-    let response = client.get(&url).send().await?.bytes().await?;
-    let bencode = BencodeRef::decode(&response, BDecodeOpt::default())
+        let bencode = BencodeRef::decode(&response, BDecodeOpt::default())
         .map_err(|e| Error::StartError(format!("Bencode decoding error: {}", e)))?;
 
-    let dict = bencode.dict()
+        let dict = bencode.dict()
         .ok_or_else(|| Error::StartError("Expected dictionary response".into()))?;
 
-    let peers_bytes = dict.lookup(b"peers")
-    .and_then(|p| p.bytes())
-    .ok_or_else(|| Error::StartError("Missing 'peers' field".into()))?;
+        let peers_bytes = dict.lookup(b"peers")
+        .and_then(|p| p.bytes())
+        .ok_or_else(|| Error::StartError("Missing 'peers' field".into()))?;
 
-    // Parse the compact peer list.
-    let mut peers = Vec::new();
-    for chunk in peers_bytes.chunks_exact(6) {
-        let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
-        let port = u16::from_be_bytes([chunk[4], chunk[5]]);
-        peers.push(SocketAddr::new(ip.into(), port));
+        // Parse the compact peer list.
+        for chunk in peers_bytes.chunks_exact(6) {
+            let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
+            let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+            let peer = SocketAddr::new(ip.into(), port);
+            if seen.contains(&peer) {
+                continue;
+            }
+            seen.insert(peer);
+            all_peers.push(peer);
+        }
     }
-
-    Ok(peers)
+    Ok(all_peers)
 }
 
 #[derive(Error, Debug)]

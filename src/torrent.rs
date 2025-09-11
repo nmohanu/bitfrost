@@ -8,7 +8,6 @@ use thiserror::Error;
 
 #[derive(Clone)]
 pub struct TorrentInfo {
-    pub announce: String,
     pub announce_list: Vec<String>,
     pub name: String,
     pub piece_length: u64,
@@ -89,7 +88,6 @@ pub fn parse_torrent_file(path: &str) -> Result<TorrentInfo, Error> {
     println!("Pieces Hashes: {:x?}", &pieces[..std::cmp::min(60, pieces.len())]);
 
     Ok(TorrentInfo {
-        announce,
         announce_list,
         name,
         piece_length,
