@@ -1,6 +1,6 @@
-use sha1::{digest::typenum::bit, Digest, Sha1};
+use sha1::{Digest, Sha1};
 
-use tokio::{fs::OpenOptions, io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream};
 
 use thiserror::Error;
 use reqwest::Client;
@@ -16,7 +16,8 @@ use std::{collections::HashMap, net::{Ipv4Addr, SocketAddr}, usize};
 
 use crate::{torrent::TorrentInfo, util::vec_u8_to_box_bool, bitfield_actor::get_requestable_piece};
 use crate::bitfield_actor::{BitfieldMsg, bitfield_actor, BitfieldSender};
-use crate::output_actor::{OutputMsg, output_actor, OutputSender, OutputReceiver};
+use crate::output_actor::{OutputMsg, output_actor, OutputSender};
+use crate::dht_protocol::dht_search;
 
 const DEFAULT_PORT: u16 = 6881; 
 const CLIENT_ID : &str = "-BF0001-"; // BitFrost client identifier.
@@ -188,7 +189,7 @@ impl PeerWorker {
                     // Have message, update bitfield.
                     println!("Worker {}: Peer has piece {}", self.peer_addr, received_index);
                     if next_piece.is_none() {
-                        let (resp_tx, mut resp_rx) = tokio::sync::oneshot::channel();
+                        let (resp_tx, _resp_rx) = tokio::sync::oneshot::channel();
                         if self.bitfield_tx.send(BitfieldMsg::RequestPiece(received_index, resp_tx)).await.is_ok() {
                             next_piece = Some(received_index);
                         }
@@ -443,6 +444,16 @@ pub async fn fetch_peers(torrent_info: &TorrentInfo, id: [u8; 20]) -> Result<Vec
             all_peers.push(peer);
         }
     }
+
+    // Add DHT nodes if available.
+    let dht_peers = dht_search(torrent_info.clone(), String::from_utf8_lossy(&id).into_owned()).await;
+    for peer in dht_peers {
+        if seen.contains(&peer) {
+            continue;
+        }
+        seen.insert(peer);
+        all_peers.push(peer);
+    }
     Ok(all_peers)
 }
 
@@ -456,7 +467,4 @@ pub enum Error {
 
     #[error(transparent)]
     Handshake(#[from] std::io::Error),
-
-    #[error("Error with downloading piece: {0}")]
-    PieceError(String),
 }

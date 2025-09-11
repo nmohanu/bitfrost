@@ -109,9 +109,6 @@ pub async fn get_requestable_piece(tx: &BitfieldSender, peer_bitfield: Box<[bool
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("Error with getting bitfield snapshot: {0}")]
-    SnapshotError(String),  
-
     #[error(transparent)]
     SendError(#[from] tokio::sync::mpsc::error::SendError<BitfieldMsg>),
 

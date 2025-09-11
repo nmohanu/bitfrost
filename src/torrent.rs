@@ -1,14 +1,13 @@
 
-use bendy::decoding::{FromBencode, Decoder, Object};
+use bendy::decoding::{FromBencode};
 use bendy::value::Value;
-
-use std::fs;
 
 use thiserror::Error;
 
 #[derive(Clone)]
 pub struct TorrentInfo {
     pub announce_list: Vec<String>,
+    pub nodes: Vec<(String, u16)>, // (host, port)
     pub name: String,
     pub piece_length: u64,
     pub length: Option<u64>,
@@ -27,31 +26,55 @@ pub fn parse_torrent_file(path: &str) -> Result<TorrentInfo, Error> {
         _ => return Err(Error::InvalidTorrent("Top-level is not a dictionary".into())),
     };
 
-
+    let mut announce_list = Vec::new();
     let announce = match dict.get(&b"announce"[..]) {
         Some(bendy::value::Value::Bytes(b)) => String::from_utf8_lossy(b).into_owned(),
-        _ => return Err(Error::InvalidTorrent("Missing 'announce'".into())),
+        _ => String::new(),
     };
-
-    // Parse announce-list if present
-    let mut announce_list = Vec::new();
-    if let Some(bendy::value::Value::List(tiers)) = dict.get(&b"announce-list"[..]) {
+    if announce != "" {
+        announce_list.push(announce.clone());
+    }
+    
+    if let Some(Value::List(tiers)) = dict.get(&b"announce-list"[..]) {
         for tier in tiers {
-            if let bendy::value::Value::List(trackers) = tier {
-                for tracker in trackers {
-                    if let bendy::value::Value::Bytes(url) = tracker {
-                        announce_list.push(String::from_utf8_lossy(url).into_owned());
-                    }
-                }
+            let trackers = match tier {
+                Value::List(trackers) => trackers,
+                _ => continue,
+            };
+            for tracker in trackers {
+                let url = match tracker {
+                    Value::Bytes(url) => url,
+                    _ => continue,
+                };
+                announce_list.push(String::from_utf8_lossy(url).into_owned());
             }
         }
     }
-    // If announce-list is empty, add the main announce URL
-    if announce_list.is_empty() {
-        announce_list.push(announce.clone());
+
+    // Parse nodes (for DHT bootstrap).
+    let mut nodes = Vec::new();
+    if let Some(Value::List(node_list)) = dict.get(&b"nodes"[..]) {
+        for node in node_list {
+            let pair = match node {
+                Value::List(pair) if pair.len() == 2 => pair,
+                _ => continue,
+            };
+            let host = match &pair[0] {
+                Value::Bytes(h) => h,
+                _ => continue,
+            };
+            let port = match &pair[1] {
+                Value::Integer(p) => *p,
+                _ => continue,
+            };
+            if let Ok(host_str) = String::from_utf8(host.to_vec()) {
+                nodes.push((host_str, port as u16));
+            }
+        }
     }
 
     println!("Announce list: {:?}", announce_list);
+    println!("DHT nodes: {:?}", nodes);
 
     let info = match dict.get(&b"info"[..]) {
         Some(bendy::value::Value::Dict(d)) => d,
@@ -89,6 +112,7 @@ pub fn parse_torrent_file(path: &str) -> Result<TorrentInfo, Error> {
 
     Ok(TorrentInfo {
         announce_list,
+        nodes,
         name,
         piece_length,
         length,
