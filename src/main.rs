@@ -4,6 +4,7 @@ mod bitfield_actor;
 mod util;
 mod output_actor;
 mod dht_protocol;
+mod peer_worker;
 
 use crate::torrent::{TorrentInfo, parse_torrent_file};
 use crate::client::TorrentClient;
